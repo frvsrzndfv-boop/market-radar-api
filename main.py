@@ -243,14 +243,102 @@ async def crypto_intraday(symbol: str = Query(..., description="币种代码，�
     return {"code": 0, "data": result, "msg": "ok"}
 
 
-# ─── 基金历史净值（兼容旧接口）──────────────────────────────
+# ─── 基金历史净值（双数据源：新浪主源 + 东方财富备用）─────────
+SINA_FUND_URL = "https://stock.finance.sina.com.cn/fundInfo/api/openapi.php/CaihuiFundInfoService.getNav"
+EM_FUND_URL = "https://api.fund.eastmoney.com/f10/lsjz"
+
+
+async def _fetch_sina_fund_history(code: str, days: int = 370) -> list:
+    """
+    新浪基金历史净值（海外可达性好，主源）
+    返回 [{date, nav}] 按日期升序，已去重
+    """
+    import asyncio
+    from datetime import datetime, timedelta
+
+    date_to = datetime.now().strftime("%Y-%m-%d")
+    date_from = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    async def fetch_page(page: int) -> dict:
+        resp = await _http.get(SINA_FUND_URL, params={
+            "symbol": code,
+            "datefrom": date_from,
+            "dateto": date_to,
+            "page": page
+        })
+        resp.raise_for_status()
+        raw = resp.json()
+        return raw.get("result", {}).get("data", {}) or {}
+
+    first = await fetch_page(1)
+    data_list = list(first.get("data") or [])
+    total = int(first.get("total_num") or 0)
+    # 新浪每页约21条；限制最多翻15页防失控
+    total_pages = min((total + 20) // 21, 15)
+
+    if total_pages > 1:
+        pages = await asyncio.gather(
+            *[fetch_page(p) for p in range(2, total_pages + 1)],
+            return_exceptions=True
+        )
+        for r in pages:
+            if isinstance(r, dict):
+                data_list.extend(r.get("data") or [])
+
+    history = []
+    for item in data_list:
+        nav = item.get("jjjz")
+        date = (item.get("fbrq") or "")[:10]
+        if nav and date:
+            try:
+                history.append({"date": date, "nav": float(nav)})
+            except (ValueError, TypeError):
+                continue
+
+    # 升序 + 按日期去重（分页边界有重叠记录）
+    history.sort(key=lambda x: x["date"])
+    seen = set()
+    dedup = []
+    for h in history:
+        if h["date"] not in seen:
+            seen.add(h["date"])
+            dedup.append(h)
+    return dedup
+
+
+async def _fetch_em_fund_history(code: str) -> list:
+    """
+    东方财富基金历史净值（国内快，备用源；海外IP可能被拦）
+    返回 [{date, nav}] 按日期升序
+    """
+    resp = await _http.get(EM_FUND_URL, params={
+        "fundCode": code,
+        "pageIndex": 1,
+        "pageSize": 365
+    }, headers={"Referer": "https://fund.eastmoney.com"})
+    resp.raise_for_status()
+    raw = resp.json()
+
+    lst = (raw or {}).get("Data", {}).get("LSJZList", []) or []
+    history = []
+    for item in reversed(lst):
+        nav = item.get("DWJZ")
+        date = item.get("FSRQ")
+        if nav and date:
+            try:
+                history.append({"date": date, "nav": float(nav)})
+            except (ValueError, TypeError):
+                continue
+    return history
+
+
 @app.get("/api/fund/history")
 async def fund_history(code: str = Query(..., description="基金代码，如 005967")):
     """
-    获取基金历史净值
-    数据来源：东方财富 lsjz API
+    获取基金历史净值（近一年）
+    数据源优先级：新浪 → 东方财富；全部失败返回 404
     """
-    if not code or len(code) != 6:
+    if not code or len(code) != 6 or not code.isdigit():
         raise HTTPException(status_code=400, detail="基金代码格式错误，需6位数字")
 
     cache_key = f"fund_history_{code}"
@@ -258,43 +346,41 @@ async def fund_history(code: str = Query(..., description="基金代码，如 00
     if cached is not None:
         return {"code": 0, "data": cached, "msg": "ok"}
 
-    url = "https://api.fund.eastmoney.com/f10/lsjz"
+    history = []
+    errors = []
+
     try:
-        resp = await _http.get(url, params={
-            "fundCode": code,
-            "pageIndex": 1,
-            "pageSize": 365
-        }, headers={
-            "Referer": "https://fund.eastmoney.com"
-        })
-        resp.raise_for_status()
-        raw = resp.json()
+        history = await _fetch_sina_fund_history(code)
+        if history:
+            logger.info(f"新浪源成功 code={code} count={len(history)}")
     except Exception as e:
-        logger.error(f"东方财富基金历史请求失败 code={code}: {e}")
-        raise HTTPException(status_code=502, detail=f"上游数据获取失败: {e}")
+        logger.error(f"新浪基金历史失败 code={code}: {e}")
+        errors.append(f"sina: {e}")
 
-    try:
-        lst = raw.get("Data", {}).get("LSJZList", [])
-        history = []
-        for item in reversed(lst):  # 按日期升序
-            nav = item.get("DWJZ")
-            date = item.get("FSRQ")
-            if nav and date:
-                history.append({"date": date, "nav": float(nav)})
+    if not history:
+        try:
+            history = await _fetch_em_fund_history(code)
+            if history:
+                logger.info(f"东方财富源成功 code={code} count={len(history)}")
+        except Exception as e:
+            logger.error(f"东方财富基金历史失败 code={code}: {e}")
+            errors.append(f"em: {e}")
 
-        result = {
-            "code": code,
-            "history": history,
-            "count": len(history),
-            "dateRange": f"{history[0]['date']}~{history[-1]['date']}" if history else ""
-        }
+    if not history:
+        raise HTTPException(
+            status_code=404,
+            detail=f"暂无该基金历史数据 ({'; '.join(errors) if errors else 'empty'})"
+        )
 
-        _set_cache(cache_key, result)
-        return {"code": 0, "data": result, "msg": "ok"}
+    result = {
+        "code": code,
+        "history": history,
+        "count": len(history),
+        "dateRange": f"{history[0]['date']}~{history[-1]['date']}"
+    }
 
-    except (KeyError, ValueError) as e:
-        logger.error(f"基金历史解析失败 code={code}: {e}")
-        raise HTTPException(status_code=502, detail=f"数据解析失败: {e}")
+    _set_cache(cache_key, result)
+    return {"code": 0, "data": result, "msg": "ok"}
 
 
 if __name__ == "__main__":
