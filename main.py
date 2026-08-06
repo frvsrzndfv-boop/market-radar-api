@@ -1,10 +1,12 @@
 """
-行情雷达 - FastAPI 后端 v2.3.0
+行情雷达 - FastAPI 后端 v2.3.1
 v2.0.0: 分时数据接口
 v2.1.0: 用户反馈接口、基金实时估值批量接口
 v2.2.0: 基金档案/股票详细行情/股票K线接口
 v2.3.0: 反馈持久化+启动加载、IP限流、CORS收紧、管理密钥加强、
          httpx生命周期管理、Sentry监控、上游解析加固、推送基础设施完善、metrics端点
+v2.3.1: 涨跌订阅登记落盘持久化（wx_subs.json，重启不丢）、stock/quote 时间字段
+         格式化为可读时间且缺失时兜底服务器时间
 """
 import os
 import re
@@ -110,7 +112,8 @@ async def lifespan(app: FastAPI):
     global _http
     _http = httpx.AsyncClient(timeout=15.0)
     _load_feedbacks()
-    logger.info("行情雷达 API v2.3.0 启动完成")
+    _load_wx_subs()
+    logger.info("行情雷达 API v2.3.1 启动完成")
     yield
     await _http.aclose()
     logger.info("行情雷达 API 已关闭")
@@ -118,7 +121,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="行情雷达 API v2",
     description="基金/股票/加密货币 实时数据中转服务",
-    version="2.3.0",
+    version="2.3.1",
     lifespan=lifespan,
 )
 
@@ -162,7 +165,7 @@ async def rate_limit_middleware(request: Request, call_next):
 # ─── 健康检查 + 监控 ────────────────────────────────────────
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "2.3.0"}
+    return {"status": "ok", "version": "2.3.1"}
 
 @app.get("/api/metrics")
 async def metrics(key: str = Query(..., description="管理密钥")):
@@ -172,7 +175,7 @@ async def metrics(key: str = Query(..., description="管理密钥")):
     return {
         "code": 0,
         "data": {
-            "version": "2.3.0",
+            "version": "2.3.1",
             "cache_size": len(_cache),
             "feedback_count": len(_feedbacks),
             "wx_subscribers": sum(len(v) for v in _wx_subs.values()),
@@ -450,6 +453,27 @@ WX_FIELD_PRICE = "number4"
 _wx_subs: Dict[str, list] = {}
 _wx_token_cache: Dict[str, Any] = {"token": None, "ts": 0}
 
+# ─── 涨跌订阅持久化（v2.3.1：进程重启不丢订阅登记）──────────────
+WX_SUBS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wx_subs.json")
+
+def _load_wx_subs():
+    try:
+        if os.path.exists(WX_SUBS_FILE):
+            with open(WX_SUBS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                _wx_subs.update({k: v for k, v in data.items() if isinstance(v, list)})
+            logger.info(f"从文件加载了 {sum(len(v) for v in _wx_subs.values())} 条涨跌订阅")
+    except Exception as e:
+        logger.warning(f"加载涨跌订阅失败: {e}")
+
+def _save_wx_subs():
+    try:
+        with open(WX_SUBS_FILE, "w", encoding="utf-8") as f:
+            json.dump(_wx_subs, f, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"涨跌订阅写入失败（忽略）: {e}")
+
 
 async def _wx_access_token() -> str:
     if _wx_token_cache["token"] and time.time() - _wx_token_cache["ts"] < 7000:
@@ -487,6 +511,7 @@ async def wx_subscribe(body: dict = Body(...)):
     subs = _wx_subs.setdefault(fund_code, [])
     if not any(s["openid"] == openid for s in subs):
         subs.append({"openid": openid, "name": fund_name, "ts": int(time.time())})
+        _save_wx_subs()
     logger.info(f"wx subscribe: fund={fund_code} openid={openid[:10]}... total={len(subs)}")
     return {"code": 0, "data": {"ok": True, "subscribers": len(subs)}, "msg": "ok"}
 
@@ -552,6 +577,7 @@ async def daily_notify(key: str = Query(...)):
                 errors.append(f"{fund_code} send: {e}")
         _wx_subs[fund_code] = []
 
+    _save_wx_subs()
     logger.info(f"daily_notify done: sent={sent} failed={failed}")
     return {"code": 0, "data": {"sent": sent, "failed": failed, "errors": errors[:10]}, "msg": "ok"}
 
@@ -785,6 +811,16 @@ def _qf(fields: list, i: int) -> str:
     return fields[i].strip() if i < len(fields) else ""
 
 
+def _norm_quote_time(raw: str) -> str:
+    """腾讯第30字段为 YYYYMMDDHHMMSS（部分品类为空），格式化为可读时间，缺失时回退服务器当前时间"""
+    raw = (raw or "").strip()
+    if re.fullmatch(r"\d{14}", raw):
+        return f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]} {raw[8:10]}:{raw[10:12]}:{raw[12:14]}"
+    if re.fullmatch(r"\d{8}", raw):
+        return f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]}"
+    return raw or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
 @app.get("/api/stock/quote")
 async def stock_quote(code: str = Query(..., description="腾讯代码，如 sh000001 / sh600519 / hkHSI")):
     if not re.fullmatch(r"[A-Za-z0-9]{2,12}", code or ""):
@@ -812,7 +848,7 @@ async def stock_quote(code: str = Query(..., description="腾讯代码，如 sh0
 
     data = {
         "code": code, "name": _qf(f, 1), "price": _qf(f, 3),
-        "prevClose": _qf(f, 4), "open": _qf(f, 5), "time": _qf(f, 30),
+        "prevClose": _qf(f, 4), "open": _qf(f, 5), "time": _norm_quote_time(_qf(f, 30)),
         "change": _qf(f, 31), "changePct": _qf(f, 32),
         "high": _qf(f, 33), "low": _qf(f, 34),
         "volume": _qf(f, 36), "amountWan": _qf(f, 37),
