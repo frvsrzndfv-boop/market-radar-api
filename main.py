@@ -2,6 +2,7 @@
 行情雷达 - FastAPI 后端 v2
 新增分时数据接口：股票/ETF分钟线、加密货币分钟K线
 v2.1.0: 新增用户反馈接口(/api/feedback)、基金实时估值批量接口(/api/fund/realtime)
+v2.2.0: 新增基金档案/股票详细行情/股票K线接口，realtime 增加日涨跌与累计净值
 """
 import os
 import re
@@ -74,7 +75,7 @@ TENCENT_CODE_MAP = {
 @app.get("/api/health")
 async def health():
     """健康检查"""
-    return {"status": "ok", "version": "2.1.0"}
+    return {"status": "ok", "version": "2.2.0"}
 
 
 @app.get("/api/intraday/stock")
@@ -489,8 +490,10 @@ async def daily_notify(key: str = Query(...)):
                         "template_id": WX_TEMPLATE_ID,
                         "page": f"pages/detail/detail?code={fund_code}",
                         "data": {
-                            WX_FIELD_CONTENT: {"value": content},
-                            WX_FIELD_DATE: {"value": date_str},
+                            WX_FIELD_NAME: {"value": name},
+                            WX_FIELD_CHANGE: {"value": ("涨" if chg >= 0 else "跌") + f"{abs(chg):.2f}%"},
+                            WX_FIELD_TIME: {"value": date_str},
+                            WX_FIELD_PRICE: {"value": f"{latest['nav']:.4f}"},
                         },
                     })
                 resp = r.json()
@@ -588,6 +591,8 @@ async def _fetch_em_latest_nav(code: str) -> Optional[Dict[str, str]]:
         return {
             "nav": item.get("DWJZ") or "",
             "navDate": item.get("FSRQ") or "",
+            "change": item.get("JZZZL") or "",
+            "accNav": item.get("LJJZ") or "",
         }
     except Exception as e:
         logger.warning(f"东方财富最新净值兜底失败 code={code}: {e}")
@@ -609,6 +614,8 @@ async def _fetch_fund_realtime_one(code: str) -> Dict[str, Any]:
             "name": "",
             "nav": fallback["nav"],
             "navDate": fallback["navDate"],
+            "change": fallback.get("change", ""),
+            "accNav": fallback.get("accNav", ""),
             "estimate": "",
             "estimateChange": "",
             "estimateTime": "",
@@ -664,6 +671,193 @@ async def fund_realtime(codes: str = Query(..., description="基金代码，逗�
 
     items = await asyncio.gather(*[_fetch_fund_realtime_one(c) for c in code_list])
     return {"code": 0, "data": {"items": list(items)}, "msg": "ok"}
+
+
+# ═══ v2.2.0 详情页数据接口 ═══════════════════════════════════
+EM_HEADERS = {"Referer": "https://fund.eastmoney.com", "User-Agent": "Mozilla/5.0"}
+EM_PZD_URL = "https://fund.eastmoney.com/pingzhongdata/{code}.js"
+EM_JBGK_URL = "https://fundf10.eastmoney.com/jbgk_{code}.html"
+TENCENT_QUOTE_URL = "https://qt.gtimg.cn/q={code}"
+TENCENT_KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+DETAIL_TTL = 21600  # 基金档案缓存 6 小时
+
+
+def _js_var_str(text: str, name: str) -> str:
+    m = re.search(r"var\s+" + re.escape(name) + r"\s*=\s*\"([^\"]*)\"", text)
+    return m.group(1) if m else ""
+
+
+def _js_var_json(text: str, name: str):
+    """提取 var name = <json>; 形式的变量并解析"""
+    m = re.search(r"var\s+" + re.escape(name) + r"\s*=\s*(\[.*?\]|\{.*?\})\s*;", text, re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except Exception:
+        return None
+
+
+def _jbgk_field(html: str, label: str) -> str:
+    m = re.search(label + r"</th><td[^>]*>(.*?)</td>", html, re.S)
+    if not m:
+        return ""
+    txt = re.sub(r"<[^>]+>", "", m.group(1))
+    return re.sub(r"\s+", " ", txt).strip()
+
+
+@app.get("/api/fund/detail")
+async def fund_detail(code: str = Query(..., description="基金代码，6位数字")):
+    """基金档案：名称/类型/公司/经理/成立日/规模/费率/区间收益（东财 pingzhongdata + F10 概况）"""
+    if not (code.isdigit() and len(code) == 6):
+        raise HTTPException(400, "基金代码格式错误")
+    cache_key = f"fund_detail_{code}"
+    cached = _get_cache(cache_key, DETAIL_TTL)
+    if cached is not None:
+        return {"code": 0, "data": cached, "msg": "ok"}
+
+    pzd_req = _http.get(EM_PZD_URL.format(code=code), headers=EM_HEADERS,
+                        params={"rt": int(time.time() * 1000)})
+    jbgk_req = _http.get(EM_JBGK_URL.format(code=code), headers=EM_HEADERS)
+    pzd_resp, jbgk_resp = await asyncio.gather(pzd_req, jbgk_req, return_exceptions=True)
+
+    info: Dict[str, Any] = {"code": code}
+
+    if not isinstance(pzd_resp, Exception) and pzd_resp.status_code == 200:
+        t = pzd_resp.text
+        info["name"] = _js_var_str(t, "fS_name")
+        # 区间收益（%）：近1月/近3月/近6月/近1年
+        info["m1"] = _js_var_str(t, "syl_1y")
+        info["m3"] = _js_var_str(t, "syl_3y")
+        info["m6"] = _js_var_str(t, "syl_6y")
+        info["y1"] = _js_var_str(t, "syl_1n")
+        info["feeOriginal"] = _js_var_str(t, "fund_sourceRate")
+        info["feeDiscount"] = _js_var_str(t, "fund_Rate")
+        info["minBuy"] = _js_var_str(t, "fund_minsg")
+        mgr = _js_var_json(t, "Data_currentFundManager")
+        if mgr and isinstance(mgr, list) and mgr:
+            m0 = mgr[0]
+            info["manager"] = m0.get("name", "")
+            info["managerWorkTime"] = m0.get("workTime", "")
+            info["managerFundSize"] = m0.get("fundSize", "")
+        scale = _js_var_json(t, "Data_fluctuationScale")
+        if scale and isinstance(scale, dict):
+            series = scale.get("series") or []
+            if series and series[-1].get("y") is not None:
+                info["scaleYi"] = series[-1]["y"]  # 最新规模（亿元）
+
+    if not isinstance(jbgk_resp, Exception) and jbgk_resp.status_code == 200:
+        html = jbgk_resp.text
+        info["type"] = _jbgk_field(html, "基金类型")
+        est = _jbgk_field(html, "成立日期/规模")
+        info["establish"] = est.split("/")[0].strip() if est else ""
+        info["assetScale"] = _jbgk_field(html, "资产规模")
+        info["company"] = _jbgk_field(html, "基金管理人")
+        if not info.get("manager"):
+            info["manager"] = _jbgk_field(html, "基金经理人")
+
+    if not info.get("name"):
+        raise HTTPException(404, "未获取到该基金档案")
+
+    _set_cache(cache_key, info)
+    return {"code": 0, "data": info, "msg": "ok"}
+
+
+def _qf(fields: list, i: int) -> str:
+    return fields[i].strip() if i < len(fields) else ""
+
+
+@app.get("/api/stock/quote")
+async def stock_quote(code: str = Query(..., description="腾讯代码，如 sh000001 / sh600519 / hkHSI")):
+    """股票/指数详细行情：开高低收/成交额/换手/PE/PB/市值/52周区间（腾讯源）"""
+    if not re.fullmatch(r"[A-Za-z0-9]{2,12}", code or ""):
+        raise HTTPException(400, "代码格式错误")
+    cache_key = f"stock_quote_{code}"
+    cached = _get_cache(cache_key, INTRADAY_TTL)
+    if cached is not None:
+        return {"code": 0, "data": cached, "msg": "ok"}
+
+    try:
+        resp = await _http.get(TENCENT_QUOTE_URL.format(code=code), timeout=10)
+        resp.raise_for_status()
+        text = resp.content.decode("gbk", errors="ignore")
+    except Exception as e:
+        raise HTTPException(502, f"行情源请求失败: {e}")
+
+    m = re.search(r'v_[A-Za-z0-9]+="([^"]*)"', text)
+    if not m or not m.group(1):
+        raise HTTPException(404, "无该代码行情")
+    f = m.group(1).split("~")
+    if len(f) < 50:
+        raise HTTPException(404, "行情字段不足")
+
+    data = {
+        "code": code,
+        "name": _qf(f, 1),
+        "price": _qf(f, 3),
+        "prevClose": _qf(f, 4),
+        "open": _qf(f, 5),
+        "time": _qf(f, 30),
+        "change": _qf(f, 31),
+        "changePct": _qf(f, 32),
+        "high": _qf(f, 33),
+        "low": _qf(f, 34),
+        "volume": _qf(f, 36),        # 成交量（手/股）
+        "amountWan": _qf(f, 37),     # 成交额（万元）
+        "turnover": _qf(f, 38),      # 换手率%
+        "pe": _qf(f, 39),
+        "amplitude": _qf(f, 43),     # 振幅%
+        "circCapYi": _qf(f, 44),     # 流通市值（亿）
+        "totalCapYi": _qf(f, 45),    # 总市值（亿）
+        "pb": _qf(f, 46),
+        "volRatio": _qf(f, 49),      # 量比
+        "avgPrice": _qf(f, 51),      # 均价
+        "high52": _qf(f, 67),
+        "low52": _qf(f, 68),
+    }
+    _set_cache(cache_key, data)
+    return {"code": 0, "data": data, "msg": "ok"}
+
+
+@app.get("/api/stock/kline")
+async def stock_kline(code: str = Query(...), count: int = Query(320, ge=10, le=800)):
+    """股票/指数日K线（真实日期）：[{date, open, close, high, low, volume}] 升序（腾讯源）"""
+    if not re.fullmatch(r"[A-Za-z0-9]{2,12}", code or ""):
+        raise HTTPException(400, "代码格式错误")
+    cache_key = f"stock_kline_{code}_{count}"
+    cached = _get_cache(cache_key, HISTORY_TTL)
+    if cached is not None:
+        return {"code": 0, "data": cached, "msg": "ok"}
+
+    try:
+        resp = await _http.get(TENCENT_KLINE_URL,
+                               params={"param": f"{code},day,,,{count},qfq"}, timeout=15)
+        resp.raise_for_status()
+        raw = resp.json()
+    except Exception as e:
+        raise HTTPException(502, f"K线源请求失败: {e}")
+
+    node = (raw.get("data") or {}).get(code) or {}
+    rows = node.get("day") or node.get("qfqday") or []
+    kline = []
+    for r in rows:
+        try:
+            kline.append({
+                "date": str(r[0])[:10],
+                "open": float(r[1]),
+                "close": float(r[2]),
+                "high": float(r[3]),
+                "low": float(r[4]),
+                "volume": float(r[5]) if len(r) > 5 else 0,
+            })
+        except (ValueError, TypeError, IndexError):
+            continue
+    if not kline:
+        raise HTTPException(404, "无K线数据")
+
+    result = {"code": code, "kline": kline, "count": len(kline)}
+    _set_cache(cache_key, result)
+    return {"code": 0, "data": result, "msg": "ok"}
 
 
 if __name__ == "__main__":
