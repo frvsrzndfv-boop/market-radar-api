@@ -1,5 +1,5 @@
 """
-行情雷达 - FastAPI 后端 v2.3.1
+行情雷达 - FastAPI 后端 v2.4.0
 v2.0.0: 分时数据接口
 v2.1.0: 用户反馈接口、基金实时估值批量接口
 v2.2.0: 基金档案/股票详细行情/股票K线接口
@@ -7,6 +7,7 @@ v2.3.0: 反馈持久化+启动加载、IP限流、CORS收紧、管理密钥加�
          httpx生命周期管理、Sentry监控、上游解析加固、推送基础设施完善、metrics端点
 v2.3.1: 涨跌订阅登记落盘持久化（wx_subs.json，重启不丢）、stock/quote 时间字段
          格式化为可读时间且缺失时兜底服务器时间
+v2.4.0: 新增 市场温度（涨跌家数+沪深成交额）、基金同类排名、宽基指数估值 三端点
 """
 import os
 import re
@@ -113,7 +114,7 @@ async def lifespan(app: FastAPI):
     _http = httpx.AsyncClient(timeout=15.0)
     _load_feedbacks()
     _load_wx_subs()
-    logger.info("行情雷达 API v2.3.1 启动完成")
+    logger.info("行情雷达 API v2.4.0 启动完成")
     yield
     await _http.aclose()
     logger.info("行情雷达 API 已关闭")
@@ -121,7 +122,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="行情雷达 API v2",
     description="基金/股票/加密货币 实时数据中转服务",
-    version="2.3.1",
+    version="2.4.0",
     lifespan=lifespan,
 )
 
@@ -165,7 +166,7 @@ async def rate_limit_middleware(request: Request, call_next):
 # ─── 健康检查 + 监控 ────────────────────────────────────────
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "2.3.1"}
+    return {"status": "ok", "version": "2.4.0"}
 
 @app.get("/api/metrics")
 async def metrics(key: str = Query(..., description="管理密钥")):
@@ -175,7 +176,7 @@ async def metrics(key: str = Query(..., description="管理密钥")):
     return {
         "code": 0,
         "data": {
-            "version": "2.3.1",
+            "version": "2.4.0",
             "cache_size": len(_cache),
             "feedback_count": len(_feedbacks),
             "wx_subscribers": sum(len(v) for v in _wx_subs.values()),
@@ -898,6 +899,256 @@ async def stock_kline(code: str = Query(...), count: int = Query(320, ge=10, le=
     _set_cache(cache_key, result)
     return {"code": 0, "data": result, "msg": "ok"}
 
+
+# ═══ v2.4.0 市场温度 / 基金同类排名 / 指数估值 ═══════════════
+EM_ZDFB_URL = "https://push2ex.eastmoney.com/getTopicZDFenBu"
+EM_ZDFB_PARAMS = {
+    "ut": "7eea3edcaed734bea9cbfc24409ed989",
+    "dpt": "wz.ztzt", "Pageindex": 0, "pagesize": 200, "sort": "zdf:asc",
+}
+DANJUAN_VALUATION_URL = "https://danjuanfunds.com/djapi/index_eva/dj"
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+VALUATION_TTL = 43200       # 12 小时
+FUND_RANK_TTL = 43200       # 12 小时
+VALUATION_WHITELIST = [
+    ("SH000016", "上证50"), ("SH000300", "沪深300"), ("SH000905", "中证500"),
+    ("SH000852", "中证1000"), ("SZ399006", "创业板指"), ("SZ399001", "深证成指"),
+]
+_amount_hist: Dict[str, float] = {}   # 成交额日历史（仅内存，进程生命周期内）
+
+
+def _beijing_now() -> datetime:
+    return datetime.now(timezone(timedelta(hours=8)))
+
+
+def _is_trading_time() -> bool:
+    now = _beijing_now()
+    if now.weekday() >= 5:
+        return False
+    hm = now.hour * 100 + now.minute
+    return (930 <= hm <= 1130) or (1300 <= hm <= 1500)
+
+
+def _ms_to_date(ms) -> str:
+    try:
+        return datetime.fromtimestamp(int(ms) / 1000, timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+@app.get("/api/market/temperature")
+async def market_temperature():
+    """市场温度：全市场涨跌家数分布 + 沪深成交额（v2.4.0）"""
+    cache_key = "market_temperature"
+    cached = _get_cache(cache_key, 60 if _is_trading_time() else 300)
+    if cached is not None:
+        return {"code": 0, "data": cached, "msg": "ok"}
+
+    today = _beijing_now().strftime("%Y%m%d")
+    zdfb_req = _http.get(EM_ZDFB_URL, params={**EM_ZDFB_PARAMS, "date": today},
+                         headers={"User-Agent": BROWSER_UA,
+                                  "Referer": "https://quote.eastmoney.com/"})
+    quote_req = _http.get(TENCENT_QUOTE_URL.format(code="sh000001,sz399001"), timeout=10)
+    zdfb_resp, quote_resp = await asyncio.gather(zdfb_req, quote_req, return_exceptions=True)
+
+    # —— 涨跌家数（东财涨跌分布口径）——
+    if isinstance(zdfb_resp, Exception):
+        logger.warning(f"涨跌分布请求失败: {zdfb_resp}")
+        raise HTTPException(502, f"涨跌分布数据源请求失败: {zdfb_resp}")
+    up = down = flat = limit_up = limit_down = 0
+    qdate = ""
+    try:
+        raw = zdfb_resp.json()
+        fb = (raw.get("data") or {}).get("fenbu") or []
+        qdate = str((raw.get("data") or {}).get("qdate") or "")
+        for cell in fb:
+            for k, v in cell.items():
+                try:
+                    n = int(k); c = int(v)
+                except Exception:
+                    continue
+                if n >= 11:
+                    limit_up += c; up += c
+                elif n <= -11:
+                    limit_down += c; down += c
+                elif n > 0:
+                    up += c
+                elif n < 0:
+                    down += c
+                else:
+                    flat += c
+    except Exception as e:
+        _log_upstream_error("em_zdfb", "market", str(e), zdfb_resp.text[:200])
+        raise HTTPException(502, f"涨跌分布解析失败: {e}")
+    total_stocks = up + down + flat
+    if total_stocks == 0:
+        raise HTTPException(502, "涨跌分布数据为空")
+
+    # —— 沪深成交额（腾讯 quote 第37字段，万元→亿；失败降级为 null）——
+    sh_amt = sz_amt = None
+    if not isinstance(quote_resp, Exception):
+        try:
+            text = quote_resp.content.decode("gbk", errors="ignore")
+            quotes = dict(re.findall(r'v_([A-Za-z0-9]+)="([^"]*)"', text))
+            def _amt_wan(cd):
+                f = quotes.get(cd, "").split("~")
+                return float(f[37]) if len(f) > 37 and f[37] else None
+            sh_amt = _amt_wan("sh000001")
+            sz_amt = _amt_wan("sz399001")
+        except Exception as e:
+            logger.warning(f"成交额解析失败（降级跳过）: {e}")
+    else:
+        logger.warning(f"成交额请求失败（降级跳过）: {quote_resp}")
+
+    total_yi = round((sh_amt + sz_amt) / 10000, 1) if (sh_amt is not None and sz_amt is not None) else None
+    date_str = f"{qdate[:4]}-{qdate[4:6]}-{qdate[6:8]}" if len(qdate) == 8 else ""
+
+    # 较昨日成交额：内存内按交易日留存，进程重启后降级为 null
+    prev_yi = None
+    chg_pct = None
+    if total_yi is not None and date_str:
+        prev_days = [d for d in _amount_hist if d < date_str]
+        if prev_days:
+            prev_yi = _amount_hist[max(prev_days)]
+            if prev_yi:
+                chg_pct = round((total_yi - prev_yi) / prev_yi * 100, 1)
+        _amount_hist[date_str] = total_yi
+        while len(_amount_hist) > 10:
+            _amount_hist.pop(min(_amount_hist))
+
+    data = {
+        "date": date_str,
+        "up": up, "down": down, "flat": flat,
+        "limitUp": limit_up, "limitDown": limit_down,
+        "upRatio": round(up / total_stocks * 100, 1),
+        "amountYi": total_yi,
+        "shAmountYi": round(sh_amt / 10000, 1) if sh_amt is not None else None,
+        "szAmountYi": round(sz_amt / 10000, 1) if sz_amt is not None else None,
+        "prevAmountYi": prev_yi,
+        "amountChgPct": chg_pct,
+        "note": "涨停/跌停按涨跌幅≥10%/≤-10%统计（东财分布口径）；成交额为沪深合计，仅供参考",
+        "source": "东方财富/腾讯",
+    }
+    _set_cache(cache_key, data)
+    return {"code": 0, "data": data, "msg": "ok"}
+
+
+@app.get("/api/fund/rank")
+async def fund_rank(code: str = Query(..., description="基金代码，6位数字")):
+    """基金同类排名与阶段涨幅（东财 pingzhongdata，v2.4.0）"""
+    if not (code.isdigit() and len(code) == 6):
+        raise HTTPException(400, "基金代码格式错误")
+    cache_key = f"fund_rank_{code}"
+    cached = _get_cache(cache_key, FUND_RANK_TTL)
+    if cached is not None:
+        return {"code": 0, "data": cached, "msg": "ok"}
+
+    try:
+        resp = await _http.get(EM_PZD_URL.format(code=code), headers=EM_HEADERS,
+                               params={"rt": int(time.time() * 1000)}, timeout=10)
+        resp.raise_for_status()
+        text = resp.text
+    except Exception as e:
+        raise HTTPException(502, f"排名数据源请求失败: {e}")
+
+    name = _js_var_str(text, "fS_name")
+    if not name:
+        raise HTTPException(404, "无该基金数据")
+
+    rank_arr = _js_var_json(text, "Data_rateInSimilarType") or []
+    pct_arr = _js_var_json(text, "Data_rateInSimilarPersent") or []
+    latest_rank = rank_arr[-1] if isinstance(rank_arr, list) and rank_arr else {}
+    latest_pct = pct_arr[-1] if isinstance(pct_arr, list) and pct_arr else []
+    if not isinstance(latest_rank, dict):
+        latest_rank = {}
+
+    try:
+        total = int(latest_rank.get("sc"))
+    except Exception:
+        total = None
+    beat = None
+    try:
+        if isinstance(latest_pct, (list, tuple)) and len(latest_pct) >= 2 and latest_pct[1] is not None:
+            beat = round(float(latest_pct[1]), 2)
+    except Exception:
+        beat = None
+
+    data = {
+        "code": code, "name": name,
+        "rank": latest_rank.get("y"),
+        "total": total,
+        "beatPercent": beat,
+        "rankDate": _ms_to_date(latest_rank.get("x") or (latest_pct[0] if isinstance(latest_pct, (list, tuple)) and latest_pct else 0)),
+        "ret1y": _js_var_str(text, "syl_1n"), "ret6m": _js_var_str(text, "syl_6y"),
+        "ret3m": _js_var_str(text, "syl_3y"), "ret1m": _js_var_str(text, "syl_1y"),
+        "note": "同类排名为东方财富滚动统计口径，阶段涨幅单位%，仅供参考",
+        "source": "东方财富",
+    }
+    _set_cache(cache_key, data)
+    return {"code": 0, "data": data, "msg": "ok"}
+
+
+@app.get("/api/index/valuation")
+async def index_valuation():
+    """宽基指数估值：PE/PB 现值与历史百分位（蛋卷，v2.4.0）"""
+    cache_key = "index_valuation"
+    cached = _get_cache(cache_key, VALUATION_TTL)
+    if cached is not None:
+        return {"code": 0, "data": cached, "msg": "ok"}
+
+    try:
+        resp = await _http.get(DANJUAN_VALUATION_URL,
+                               headers={"User-Agent": BROWSER_UA,
+                                        "Referer": "https://danjuanfunds.com/"},
+                               timeout=10)
+        resp.raise_for_status()
+        raw = resp.json()
+    except Exception as e:
+        raise HTTPException(502, f"估值数据源请求失败: {e}")
+
+    items_raw = (raw.get("data") or {}).get("items") or []
+    if not items_raw:
+        _log_upstream_error("danjuan_valuation", "index", "items 为空", str(raw)[:200])
+        raise HTTPException(502, "估值数据为空")
+
+    name_map = dict(VALUATION_WHITELIST)
+    order = {c: i for i, (c, _) in enumerate(VALUATION_WHITELIST)}
+    items: List[Dict[str, Any]] = []
+    latest_ts = 0
+    for it in items_raw:
+        c = it.get("index_code")
+        if c not in name_map:
+            continue
+        try:
+            latest_ts = max(latest_ts, int(it.get("ts") or 0))
+        except Exception:
+            pass
+        pe = it.get("pe") or 0
+        pb = it.get("pb") or 0
+        items.append({
+            "code": c, "name": name_map[c],
+            "pe": round(pe, 2) if pe else None,
+            "pePercentile": round((it.get("pe_percentile") or 0) * 100, 1) if pe else None,
+            "pb": round(pb, 3) if pb else None,
+            "pbPercentile": round((it.get("pb_percentile") or 0) * 100, 1) if pb else None,
+            "roe": round((it.get("roe") or 0) * 100, 2) or None,
+            "dividendYield": round((it.get("yeild") or 0) * 100, 2) or None,
+            "evaType": it.get("eva_type") or "",
+        })
+    items.sort(key=lambda x: order.get(x["code"], 99))
+    if not items:
+        raise HTTPException(502, "估值数据无白名单指数")
+
+    data = {
+        "date": _ms_to_date(latest_ts),
+        "items": items,
+        "evaTypeMap": {"low": "偏低", "mid": "适中", "high": "偏高"},
+        "note": "百分位为历史分位（蛋卷口径），估值仅供参考，不构成投资建议",
+        "source": "蛋卷基金",
+    }
+    _set_cache(cache_key, data)
+    return {"code": 0, "data": data, "msg": "ok"}
 
 if __name__ == "__main__":
     import uvicorn
