@@ -166,7 +166,7 @@ async def rate_limit_middleware(request: Request, call_next):
 # ─── 健康检查 + 监控 ────────────────────────────────────────
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "2.4.0"}
+    return {"status": "ok", "version": "2.4.1"}
 
 @app.get("/api/metrics")
 async def metrics(key: str = Query(..., description="管理密钥")):
@@ -915,7 +915,49 @@ VALUATION_WHITELIST = [
     ("SH000016", "上证50"), ("SH000300", "沪深300"), ("SH000905", "中证500"),
     ("SH000852", "中证1000"), ("SZ399006", "创业板指"), ("SZ399001", "深证成指"),
 ]
-_amount_hist: Dict[str, float] = {}   # 成交额日历史（仅内存，进程生命周期内）
+_amount_hist: Dict[str, float] = {}   # 成交额日历史（仅内存，v2.4.1 起降级为兜底）
+
+# v2.4.1 东财日K：无状态取上一交易日成交额（不再依赖内存历史，进程重启不丢）
+EM_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+
+
+async def _fetch_prev_amount_yi(date_str: str) -> Optional[float]:
+    """从东财日K无状态获取 date_str 之前最近一个交易日的沪深成交额合计（亿元）。
+    date_str 格式 YYYY-MM-DD；失败或缺数据返回 None（调用方回退内存历史）。"""
+    if not date_str:
+        return None
+
+    async def _one(secid: str) -> Optional[float]:
+        try:
+            r = await _http.get(
+                EM_KLINE_URL,
+                params={
+                    "secid": secid,
+                    "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+                    "fields1": "f1,f2,f3,f4,f5,f6",
+                    "fields2": "f51,f57",
+                    "klt": "101", "fqt": "0", "lmt": "5", "end": "20500101",
+                },
+                headers={"User-Agent": BROWSER_UA,
+                         "Referer": "https://quote.eastmoney.com/"},
+                timeout=10,
+            )
+            klines = ((r.json() or {}).get("data") or {}).get("klines") or []
+            prev = None
+            for row in klines:
+                parts = str(row).split(",")
+                # fields2 顺序：f51=日期, f57=成交额(元)；严格取早于数据日的最近一根
+                if len(parts) >= 2 and parts[0] < date_str and parts[1]:
+                    prev = float(parts[1])
+            return prev
+        except Exception as e:
+            logger.warning(f"上一交易日成交额获取失败({secid}): {e}")
+            return None
+
+    sh_amt, sz_amt = await asyncio.gather(_one("1.000001"), _one("0.399001"))
+    if sh_amt is not None and sz_amt is not None:
+        return round((sh_amt + sz_amt) / 100000000, 1)
+    return None
 
 
 def _beijing_now() -> datetime:
@@ -1004,15 +1046,17 @@ async def market_temperature():
     total_yi = round((sh_amt + sz_amt) / 10000, 1) if (sh_amt is not None and sz_amt is not None) else None
     date_str = f"{qdate[:4]}-{qdate[4:6]}-{qdate[6:8]}" if len(qdate) == 8 else ""
 
-    # 较昨日成交额：内存内按交易日留存，进程重启后降级为 null
+    # 较昨日成交额：v2.4.1 起优先东财日K无状态获取（重启不丢），失败回退内存历史
     prev_yi = None
     chg_pct = None
-    if total_yi is not None and date_str:
-        prev_days = [d for d in _amount_hist if d < date_str]
-        if prev_days:
-            prev_yi = _amount_hist[max(prev_days)]
-            if prev_yi:
-                chg_pct = round((total_yi - prev_yi) / prev_yi * 100, 1)
+    if total_yi is not None and total_yi > 0 and date_str:
+        prev_yi = await _fetch_prev_amount_yi(date_str)
+        if prev_yi is None:
+            prev_days = [d for d in _amount_hist if d < date_str]
+            if prev_days:
+                prev_yi = _amount_hist[max(prev_days)]
+        if prev_yi:
+            chg_pct = round((total_yi - prev_yi) / prev_yi * 100, 1)
         _amount_hist[date_str] = total_yi
         while len(_amount_hist) > 10:
             _amount_hist.pop(min(_amount_hist))
