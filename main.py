@@ -1,5 +1,5 @@
 """
-行情雷达 - FastAPI 后端 v2.4.3
+行情雷达 - FastAPI 后端 v2.4.4
 v2.0.0: 分时数据接口
 v2.1.0: 用户反馈接口、基金实时估值批量接口
 v2.2.0: 基金档案/股票详细行情/股票K线接口
@@ -12,6 +12,7 @@ v2.4.1: 昨日成交额东财日K无状态化（重启不丢，内存历史降�
 v2.4.2: 补上 /api/admin/backup_state 状态导出端点（供每日GitHub备份）；
          metrics 版本号修正；昨日成交额多主机容错 + 最近错误诊断
 v2.4.3: 昨日成交额新增搜狐hisHq为主源（东财push2his对海外机房断连，搜狐可达）
+v2.4.4: prev_amount_debug 改为逐源错误列表（诊断搜狐源在海外机房的失败原因）
 """
 import os
 import re
@@ -170,7 +171,7 @@ async def rate_limit_middleware(request: Request, call_next):
 # ─── 健康检查 + 监控 ────────────────────────────────────────
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "2.4.3"}
+    return {"status": "ok", "version": "2.4.4"}
 
 @app.get("/api/metrics")
 async def metrics(key: str = Query(..., description="管理密钥")):
@@ -180,7 +181,7 @@ async def metrics(key: str = Query(..., description="管理密钥")):
     return {
         "code": 0,
         "data": {
-            "version": "2.4.3",
+            "version": "2.4.4",
             "cache_size": len(_cache),
             "feedback_count": len(_feedbacks),
             "wx_subscribers": sum(len(v) for v in _wx_subs.values()),
@@ -200,7 +201,7 @@ async def backup_state(key: str = Query(..., description="管理密钥")):
     return {
         "code": 0,
         "data": {
-            "version": "2.4.3",
+            "version": "2.4.4",
             "exported_at": _beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
             "wx_subs": _wx_subs,
             "feedbacks": _feedbacks,
@@ -949,7 +950,12 @@ EM_KLINE_HOSTS = [
     "https://48.push2his.eastmoney.com",
 ]
 EM_KLINE_PATH = "/api/qt/stock/kline/get"
-_prev_amount_debug: Dict[str, Any] = {"last_ok_at": None, "last_error": None}
+_prev_amount_debug: Dict[str, Any] = {"last_ok_at": None, "errors": []}
+
+def _dbg_err(msg: str):
+    errs = _prev_amount_debug.setdefault("errors", [])
+    errs.append(f"{_beijing_now().strftime('%m-%d %H:%M:%S')} {msg}"[:220])
+    del errs[:-6]
 
 
 async def _fetch_prev_amount_yi(date_str: str) -> Optional[float]:
@@ -993,14 +999,12 @@ async def _fetch_prev_amount_yi(date_str: str) -> Optional[float]:
                 last_err = f"{host}: {type(e).__name__} {e}"
                 continue
         logger.warning(f"上一交易日成交额获取失败({secid}): {last_err}")
-        _prev_amount_debug["last_error"] = (
-            f"{_beijing_now().strftime('%Y-%m-%d %H:%M:%S')} {secid} {last_err}")
+        _dbg_err(f"EM {secid} {last_err}")
         return None
 
     sh_amt, sz_amt = await asyncio.gather(_one("1.000001"), _one("0.399001"))
     if sh_amt is not None and sz_amt is not None:
         _prev_amount_debug["last_ok_at"] = _beijing_now().strftime("%Y-%m-%d %H:%M:%S")
-        _prev_amount_debug["last_error"] = None
         return round((sh_amt + sz_amt) / 100000000, 1)
     return None
 
@@ -1032,14 +1036,11 @@ async def _fetch_prev_amount_yi_sohu(date_str: str) -> Optional[float]:
             for row in hq:
                 if isinstance(row, list) and len(row) >= 9 and row[0] < date_str and row[8]:
                     return float(row[8])
-            _prev_amount_debug["last_error"] = (
-                f"{_beijing_now().strftime('%Y-%m-%d %H:%M:%S')} sohu {code} 无有效行")
+            _dbg_err(f"sohu {code} 无有效行: {str(hq)[:120]}")
             return None
         except Exception as e:
             logger.warning(f"搜狐上一交易日成交额获取失败({code}): {e}")
-            _prev_amount_debug["last_error"] = (
-                f"{_beijing_now().strftime('%Y-%m-%d %H:%M:%S')} sohu {code} "
-                f"{type(e).__name__} {e}")
+            _dbg_err(f"sohu {code} {type(e).__name__} {e}")
             return None
 
     sh_wan, sz_wan = await asyncio.gather(_one("zs_000001"), _one("zs_399001"))
