@@ -1,5 +1,5 @@
 """
-行情雷达 - FastAPI 后端 v2.4.4
+行情雷达 - FastAPI 后端 v2.4.5
 v2.0.0: 分时数据接口
 v2.1.0: 用户反馈接口、基金实时估值批量接口
 v2.2.0: 基金档案/股票详细行情/股票K线接口
@@ -13,6 +13,7 @@ v2.4.2: 补上 /api/admin/backup_state 状态导出端点（供每日GitHub备�
          metrics 版本号修正；昨日成交额多主机容错 + 最近错误诊断
 v2.4.3: 昨日成交额新增搜狐hisHq为主源（东财push2his对海外机房断连，搜狐可达）
 v2.4.4: prev_amount_debug 改为逐源错误列表（诊断搜狐源在海外机房的失败原因）
+v2.4.5: 昨日成交额主源换同花顺日K（搜狐WAF拦截机房IP返回非JSON；东财push2his断连）
 """
 import os
 import re
@@ -171,7 +172,7 @@ async def rate_limit_middleware(request: Request, call_next):
 # ─── 健康检查 + 监控 ────────────────────────────────────────
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "2.4.4"}
+    return {"status": "ok", "version": "2.4.5"}
 
 @app.get("/api/metrics")
 async def metrics(key: str = Query(..., description="管理密钥")):
@@ -181,7 +182,7 @@ async def metrics(key: str = Query(..., description="管理密钥")):
     return {
         "code": 0,
         "data": {
-            "version": "2.4.4",
+            "version": "2.4.5",
             "cache_size": len(_cache),
             "feedback_count": len(_feedbacks),
             "wx_subscribers": sum(len(v) for v in _wx_subs.values()),
@@ -201,7 +202,7 @@ async def backup_state(key: str = Query(..., description="管理密钥")):
     return {
         "code": 0,
         "data": {
-            "version": "2.4.4",
+            "version": "2.4.5",
             "exported_at": _beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
             "wx_subs": _wx_subs,
             "feedbacks": _feedbacks,
@@ -964,6 +965,10 @@ async def _fetch_prev_amount_yi(date_str: str) -> Optional[float]:
     if not date_str:
         return None
 
+    ths = await _fetch_prev_amount_yi_ths(date_str)
+    if ths is not None:
+        return ths
+
     sohu = await _fetch_prev_amount_yi_sohu(date_str)
     if sohu is not None:
         return sohu
@@ -1046,6 +1051,51 @@ async def _fetch_prev_amount_yi_sohu(date_str: str) -> Optional[float]:
     sh_wan, sz_wan = await asyncio.gather(_one("zs_000001"), _one("zs_399001"))
     if sh_wan is not None and sz_wan is not None:
         return round((sh_wan + sz_wan) / 10000, 1)
+    return None
+
+
+# v2.4.5 同花顺日K主源：data 行[6]=成交额(元)，CDN数据站对机房IP友好
+THS_LINE_URL = "https://d.10jqka.com.cn/v6/line/{code}/01/last8.js"
+
+
+async def _fetch_prev_amount_yi_ths(date_str: str) -> Optional[float]:
+    """同花顺日K无状态取 date_str 之前最近一个交易日沪深成交额合计（亿元）。"""
+    target = date_str.replace("-", "")
+    if len(target) != 8:
+        return None
+
+    async def _one(code: str) -> Optional[float]:
+        try:
+            r = await _http.get(
+                THS_LINE_URL.format(code=code),
+                headers={"User-Agent": BROWSER_UA,
+                         "Referer": "http://q.10jqka.com.cn/"},
+                timeout=8,
+            )
+            m = re.search(r"\((\{.*\})\)", r.text, re.S)
+            rows = ((json.loads(m.group(1)) if m else {}).get("data") or "").split(";")
+            prev = None
+            for row in rows:
+                parts = row.split(",")
+                # 行: 日期,开,高,低,收,成交量,成交额(元),...；日期升序，取早于数据日的最后一根
+                if len(parts) >= 7 and parts[0] < target and parts[6]:
+                    try:
+                        prev = float(parts[6])
+                    except Exception:
+                        pass
+            if prev is not None:
+                return prev
+            _dbg_err(f"ths {code} 无有效行: {r.text[:100]}")
+            return None
+        except Exception as e:
+            logger.warning(f"同花顺上一交易日成交额获取失败({code}): {e}")
+            _dbg_err(f"ths {code} {type(e).__name__} {e}")
+            return None
+
+    shy, szy = await asyncio.gather(_one("hs_1A0001"), _one("hs_399001"))
+    if shy is not None and szy is not None:
+        _prev_amount_debug["last_ok_at"] = _beijing_now().strftime("%Y-%m-%d %H:%M:%S")
+        return round((shy + szy) / 100000000, 1)
     return None
 
 
