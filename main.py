@@ -62,6 +62,7 @@ _cache: Dict[str, Dict] = {}
 INTRADAY_TTL = 60
 HISTORY_TTL  = 1800
 DETAIL_TTL = 21600
+REALTIME_TTL = 60          # v2.4.6 基金实时估值/净值缓存
 
 def _get_cache(key: str, ttl: int) -> Optional[Any]:
     if key in _cache and (time.time() - _cache[key]["ts"]) < ttl:
@@ -128,7 +129,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="行情雷达 API v2",
     description="基金/股票/加密货币 实时数据中转服务",
-    version="2.4.0",
+    version="2.4.6",
     lifespan=lifespan,
 )
 
@@ -172,7 +173,7 @@ async def rate_limit_middleware(request: Request, call_next):
 # ─── 健康检查 + 监控 ────────────────────────────────────────
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "2.4.5"}
+    return {"status": "ok", "version": "2.4.6"}
 
 @app.get("/api/metrics")
 async def metrics(key: str = Query(..., description="管理密钥")):
@@ -182,7 +183,7 @@ async def metrics(key: str = Query(..., description="管理密钥")):
     return {
         "code": 0,
         "data": {
-            "version": "2.4.5",
+            "version": "2.4.6",
             "cache_size": len(_cache),
             "feedback_count": len(_feedbacks),
             "wx_subscribers": sum(len(v) for v in _wx_subs.values()),
@@ -202,7 +203,7 @@ async def backup_state(key: str = Query(..., description="管理密钥")):
     return {
         "code": 0,
         "data": {
-            "version": "2.4.5",
+            "version": "2.4.6",
             "exported_at": _beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
             "wx_subs": _wx_subs,
             "feedbacks": _feedbacks,
@@ -735,8 +736,25 @@ async def fund_realtime(codes: str = Query(..., description="基金代码，逗�
     if not code_list:
         return {"code": 0, "data": {"items": []}, "msg": "ok"}
 
-    items = await asyncio.gather(*[_fetch_fund_realtime_one(c) for c in code_list])
-    return {"code": 0, "data": {"items": list(items)}, "msg": "ok"}
+    # v2.4.6 逐只60s缓存：命中直接取，未命中并发抓后写缓存（error不缓存）
+    results: Dict[str, Any] = {}
+    todo: List[str] = []
+    for c in code_list:
+        hit = _get_cache(f"fund_rt_{c}", REALTIME_TTL)
+        if hit is not None:
+            results[c] = hit
+        else:
+            todo.append(c)
+    if todo:
+        fetched = await asyncio.gather(*[_fetch_fund_realtime_one(c) for c in todo])
+        for item in fetched:
+            c = item.get("code", "")
+            if c:
+                results[c] = item
+                if not item.get("error"):
+                    _set_cache(f"fund_rt_{c}", item)
+    items = [results[c] for c in code_list if c in results]
+    return {"code": 0, "data": {"items": items}, "msg": "ok"}
 
 
 # ═══ 详情页数据接口 ══════════════════════════════════════════
@@ -887,6 +905,60 @@ async def stock_quote(code: str = Query(..., description="腾讯代码，如 sh0
     }
     _set_cache(cache_key, data)
     return {"code": 0, "data": data, "msg": "ok"}
+
+
+@app.get("/api/stock/quotes")
+async def stock_quotes(codes: str = Query(..., description="腾讯代码，逗号分隔，最多50只")):
+    """v2.4.6 批量股票/ETF行情：腾讯一次请求多只，逐只60s缓存，供列表页ETF实时化"""
+    code_list: List[str] = []
+    seen = set()
+    for c in codes.split(","):
+        c = c.strip()
+        if re.fullmatch(r"[A-Za-z0-9]{2,12}", c or "") and c not in seen:
+            seen.add(c)
+            code_list.append(c)
+    code_list = code_list[:50]
+    if not code_list:
+        return {"code": 0, "data": {"items": []}, "msg": "ok"}
+
+    results: Dict[str, Any] = {}
+    todo: List[str] = []
+    for c in code_list:
+        hit = _get_cache(f"stock_quote_{c}", INTRADAY_TTL)
+        if hit is not None:
+            results[c] = hit
+        else:
+            todo.append(c)
+
+    if todo:
+        try:
+            resp = await _http.get(TENCENT_QUOTE_URL.format(code=",".join(todo)), timeout=10)
+            resp.raise_for_status()
+            text = resp.content.decode("gbk", errors="ignore")
+            for m in re.finditer(r'v_([A-Za-z0-9]+)="([^"]*)"', text):
+                c, payload = m.group(1), m.group(2)
+                f = payload.split("~")
+                if len(f) < 50:
+                    continue
+                data = {
+                    "code": c, "name": _qf(f, 1), "price": _qf(f, 3),
+                    "prevClose": _qf(f, 4), "open": _qf(f, 5), "time": _norm_quote_time(_qf(f, 30)),
+                    "change": _qf(f, 31), "changePct": _qf(f, 32),
+                    "high": _qf(f, 33), "low": _qf(f, 34),
+                    "volume": _qf(f, 36), "amountWan": _qf(f, 37),
+                    "turnover": _qf(f, 38), "pe": _qf(f, 39),
+                    "amplitude": _qf(f, 43), "circCapYi": _qf(f, 44),
+                    "totalCapYi": _qf(f, 45), "pb": _qf(f, 46),
+                    "volRatio": _qf(f, 49), "avgPrice": _qf(f, 51),
+                    "high52": _qf(f, 67), "low52": _qf(f, 68),
+                }
+                results[c] = data
+                _set_cache(f"stock_quote_{c}", data)
+        except Exception as e:
+            _log_upstream_error("tencent_quotes_batch", ",".join(todo)[:80], f"请求异常: {e}")
+
+    items = [results[c] for c in code_list if c in results]
+    return {"code": 0, "data": {"items": items}, "msg": "ok"}
 
 
 @app.get("/api/stock/kline")
