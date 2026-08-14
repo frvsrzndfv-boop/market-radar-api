@@ -1,5 +1,5 @@
 """
-行情雷达 - FastAPI 后端 v2.4.0
+行情雷达 - FastAPI 后端 v2.4.2
 v2.0.0: 分时数据接口
 v2.1.0: 用户反馈接口、基金实时估值批量接口
 v2.2.0: 基金档案/股票详细行情/股票K线接口
@@ -8,6 +8,9 @@ v2.3.0: 反馈持久化+启动加载、IP限流、CORS收紧、管理密钥加�
 v2.3.1: 涨跌订阅登记落盘持久化（wx_subs.json，重启不丢）、stock/quote 时间字段
          格式化为可读时间且缺失时兜底服务器时间
 v2.4.0: 新增 市场温度（涨跌家数+沪深成交额）、基金同类排名、宽基指数估值 三端点
+v2.4.1: 昨日成交额东财日K无状态化（重启不丢，内存历史降级兜底）
+v2.4.2: 补上 /api/admin/backup_state 状态导出端点（供每日GitHub备份）；
+         metrics 版本号修正；昨日成交额多主机容错 + 最近错误诊断
 """
 import os
 import re
@@ -166,7 +169,7 @@ async def rate_limit_middleware(request: Request, call_next):
 # ─── 健康检查 + 监控 ────────────────────────────────────────
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "2.4.1"}
+    return {"status": "ok", "version": "2.4.2"}
 
 @app.get("/api/metrics")
 async def metrics(key: str = Query(..., description="管理密钥")):
@@ -176,12 +179,32 @@ async def metrics(key: str = Query(..., description="管理密钥")):
     return {
         "code": 0,
         "data": {
-            "version": "2.4.0",
+            "version": "2.4.2",
             "cache_size": len(_cache),
             "feedback_count": len(_feedbacks),
             "wx_subscribers": sum(len(v) for v in _wx_subs.values()),
             "rate_limited_ips": len(_rate_limits),
             "http_client_closed": _http is None or _http.is_closed,
+        },
+        "msg": "ok",
+    }
+
+
+@app.get("/api/admin/backup_state")
+async def backup_state(key: str = Query(..., description="管理密钥")):
+    """v2.4.2 状态导出：供每日 GitHub 备份任务拉取。
+    含涨跌订阅(openid)、用户反馈、成交额内存历史、昨日成交额诊断。"""
+    if key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="bad key")
+    return {
+        "code": 0,
+        "data": {
+            "version": "2.4.2",
+            "exported_at": _beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
+            "wx_subs": _wx_subs,
+            "feedbacks": _feedbacks,
+            "amount_hist": _amount_hist,
+            "prev_amount_debug": _prev_amount_debug,
         },
         "msg": "ok",
     }
@@ -918,7 +941,14 @@ VALUATION_WHITELIST = [
 _amount_hist: Dict[str, float] = {}   # 成交额日历史（仅内存，v2.4.1 起降级为兜底）
 
 # v2.4.1 东财日K：无状态取上一交易日成交额（不再依赖内存历史，进程重启不丢）
-EM_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+# v2.4.2 多主机容错 + 诊断记录
+EM_KLINE_HOSTS = [
+    "https://push2his.eastmoney.com",
+    "https://92.push2his.eastmoney.com",
+    "https://48.push2his.eastmoney.com",
+]
+EM_KLINE_PATH = "/api/qt/stock/kline/get"
+_prev_amount_debug: Dict[str, Any] = {"last_ok_at": None, "last_error": None}
 
 
 async def _fetch_prev_amount_yi(date_str: str) -> Optional[float]:
@@ -928,34 +958,44 @@ async def _fetch_prev_amount_yi(date_str: str) -> Optional[float]:
         return None
 
     async def _one(secid: str) -> Optional[float]:
-        try:
-            r = await _http.get(
-                EM_KLINE_URL,
-                params={
-                    "secid": secid,
-                    "ut": "fa5fd1943c7b386f172d6893dbfba10b",
-                    "fields1": "f1,f2,f3,f4,f5,f6",
-                    "fields2": "f51,f57",
-                    "klt": "101", "fqt": "0", "lmt": "5", "end": "20500101",
-                },
-                headers={"User-Agent": BROWSER_UA,
-                         "Referer": "https://quote.eastmoney.com/"},
-                timeout=10,
-            )
-            klines = ((r.json() or {}).get("data") or {}).get("klines") or []
-            prev = None
-            for row in klines:
-                parts = str(row).split(",")
-                # fields2 顺序：f51=日期, f57=成交额(元)；严格取早于数据日的最近一根
-                if len(parts) >= 2 and parts[0] < date_str and parts[1]:
-                    prev = float(parts[1])
-            return prev
-        except Exception as e:
-            logger.warning(f"上一交易日成交额获取失败({secid}): {e}")
-            return None
+        last_err = None
+        for host in EM_KLINE_HOSTS:
+            try:
+                r = await _http.get(
+                    host + EM_KLINE_PATH,
+                    params={
+                        "secid": secid,
+                        "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+                        "fields1": "f1,f2,f3,f4,f5,f6",
+                        "fields2": "f51,f57",
+                        "klt": "101", "fqt": "0", "lmt": "5", "end": "20500101",
+                    },
+                    headers={"User-Agent": BROWSER_UA,
+                             "Referer": "https://quote.eastmoney.com/"},
+                    timeout=8,
+                )
+                klines = ((r.json() or {}).get("data") or {}).get("klines") or []
+                prev = None
+                for row in klines:
+                    parts = str(row).split(",")
+                    # fields2 顺序：f51=日期, f57=成交额(元)；严格取早于数据日的最近一根
+                    if len(parts) >= 2 and parts[0] < date_str and parts[1]:
+                        prev = float(parts[1])
+                if prev is not None:
+                    return prev
+                last_err = f"{host} 无有效K线: {str(klines)[:120]}"
+            except Exception as e:
+                last_err = f"{host}: {type(e).__name__} {e}"
+                continue
+        logger.warning(f"上一交易日成交额获取失败({secid}): {last_err}")
+        _prev_amount_debug["last_error"] = (
+            f"{_beijing_now().strftime('%Y-%m-%d %H:%M:%S')} {secid} {last_err}")
+        return None
 
     sh_amt, sz_amt = await asyncio.gather(_one("1.000001"), _one("0.399001"))
     if sh_amt is not None and sz_amt is not None:
+        _prev_amount_debug["last_ok_at"] = _beijing_now().strftime("%Y-%m-%d %H:%M:%S")
+        _prev_amount_debug["last_error"] = None
         return round((sh_amt + sz_amt) / 100000000, 1)
     return None
 
