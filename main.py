@@ -1,5 +1,5 @@
 """
-行情雷达 - FastAPI 后端 v2.4.2
+行情雷达 - FastAPI 后端 v2.4.3
 v2.0.0: 分时数据接口
 v2.1.0: 用户反馈接口、基金实时估值批量接口
 v2.2.0: 基金档案/股票详细行情/股票K线接口
@@ -11,6 +11,7 @@ v2.4.0: 新增 市场温度（涨跌家数+沪深成交额）、基金同类排�
 v2.4.1: 昨日成交额东财日K无状态化（重启不丢，内存历史降级兜底）
 v2.4.2: 补上 /api/admin/backup_state 状态导出端点（供每日GitHub备份）；
          metrics 版本号修正；昨日成交额多主机容错 + 最近错误诊断
+v2.4.3: 昨日成交额新增搜狐hisHq为主源（东财push2his对海外机房断连，搜狐可达）
 """
 import os
 import re
@@ -169,7 +170,7 @@ async def rate_limit_middleware(request: Request, call_next):
 # ─── 健康检查 + 监控 ────────────────────────────────────────
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "2.4.2"}
+    return {"status": "ok", "version": "2.4.3"}
 
 @app.get("/api/metrics")
 async def metrics(key: str = Query(..., description="管理密钥")):
@@ -179,7 +180,7 @@ async def metrics(key: str = Query(..., description="管理密钥")):
     return {
         "code": 0,
         "data": {
-            "version": "2.4.2",
+            "version": "2.4.3",
             "cache_size": len(_cache),
             "feedback_count": len(_feedbacks),
             "wx_subscribers": sum(len(v) for v in _wx_subs.values()),
@@ -199,7 +200,7 @@ async def backup_state(key: str = Query(..., description="管理密钥")):
     return {
         "code": 0,
         "data": {
-            "version": "2.4.2",
+            "version": "2.4.3",
             "exported_at": _beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
             "wx_subs": _wx_subs,
             "feedbacks": _feedbacks,
@@ -957,6 +958,10 @@ async def _fetch_prev_amount_yi(date_str: str) -> Optional[float]:
     if not date_str:
         return None
 
+    sohu = await _fetch_prev_amount_yi_sohu(date_str)
+    if sohu is not None:
+        return sohu
+
     async def _one(secid: str) -> Optional[float]:
         last_err = None
         for host in EM_KLINE_HOSTS:
@@ -997,6 +1002,49 @@ async def _fetch_prev_amount_yi(date_str: str) -> Optional[float]:
         _prev_amount_debug["last_ok_at"] = _beijing_now().strftime("%Y-%m-%d %H:%M:%S")
         _prev_amount_debug["last_error"] = None
         return round((sh_amt + sz_amt) / 100000000, 1)
+    return None
+
+
+# v2.4.3 搜狐日K主源：hisHq 行[8]=成交额(万元)，对海外机房友好
+SOHU_HISQ_URL = "https://q.stock.sohu.com/hisHq"
+
+
+async def _fetch_prev_amount_yi_sohu(date_str: str) -> Optional[float]:
+    """搜狐hisHq无状态取 date_str 之前最近一个交易日沪深成交额合计（亿元）。"""
+    try:
+        d0 = datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=12)
+        start = d0.strftime("%Y%m%d")
+        end = date_str.replace("-", "")
+    except Exception:
+        return None
+
+    async def _one(code: str) -> Optional[float]:
+        try:
+            r = await _http.get(
+                SOHU_HISQ_URL,
+                params={"code": code, "start": start, "end": end},
+                headers={"User-Agent": BROWSER_UA},
+                timeout=8,
+            )
+            arr = r.json()
+            hq = (arr[0] if isinstance(arr, list) and arr else {}).get("hq") or []
+            # 返回按日期最新在前；第一根早于数据日的即上一交易日；行[8]=成交额(万元)
+            for row in hq:
+                if isinstance(row, list) and len(row) >= 9 and row[0] < date_str and row[8]:
+                    return float(row[8])
+            _prev_amount_debug["last_error"] = (
+                f"{_beijing_now().strftime('%Y-%m-%d %H:%M:%S')} sohu {code} 无有效行")
+            return None
+        except Exception as e:
+            logger.warning(f"搜狐上一交易日成交额获取失败({code}): {e}")
+            _prev_amount_debug["last_error"] = (
+                f"{_beijing_now().strftime('%Y-%m-%d %H:%M:%S')} sohu {code} "
+                f"{type(e).__name__} {e}")
+            return None
+
+    sh_wan, sz_wan = await asyncio.gather(_one("zs_000001"), _one("zs_399001"))
+    if sh_wan is not None and sz_wan is not None:
+        return round((sh_wan + sz_wan) / 10000, 1)
     return None
 
 
