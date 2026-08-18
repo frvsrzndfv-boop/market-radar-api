@@ -14,6 +14,8 @@ v2.4.2: 补上 /api/admin/backup_state 状态导出端点（供每日GitHub备�
 v2.4.3: 昨日成交额新增搜狐hisHq为主源（东财push2his对海外机房断连，搜狐可达）
 v2.4.4: prev_amount_debug 改为逐源错误列表（诊断搜狐源在海外机房的失败原因）
 v2.4.5: 昨日成交额主源换同花顺日K（搜狐WAF拦截机房IP返回非JSON；东财push2his断连）
+v2.4.7: 新增 /api/sector/list 板块榜端点（腾讯 proxy.finance.qq.com，
+         一级行业hy/二级行业hy2/概念gn，60s缓存；板块quote/kline 复用既有 stock 端点，pt代码同源）
 """
 import os
 import re
@@ -129,7 +131,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="行情雷达 API v2",
     description="基金/股票/加密货币 实时数据中转服务",
-    version="2.4.6",
+    version="2.4.7",
     lifespan=lifespan,
 )
 
@@ -173,7 +175,7 @@ async def rate_limit_middleware(request: Request, call_next):
 # ─── 健康检查 + 监控 ────────────────────────────────────────
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "2.4.6"}
+    return {"status": "ok", "version": "2.4.7"}
 
 @app.get("/api/metrics")
 async def metrics(key: str = Query(..., description="管理密钥")):
@@ -183,7 +185,7 @@ async def metrics(key: str = Query(..., description="管理密钥")):
     return {
         "code": 0,
         "data": {
-            "version": "2.4.6",
+            "version": "2.4.7",
             "cache_size": len(_cache),
             "feedback_count": len(_feedbacks),
             "wx_subscribers": sum(len(v) for v in _wx_subs.values()),
@@ -203,7 +205,7 @@ async def backup_state(key: str = Query(..., description="管理密钥")):
     return {
         "code": 0,
         "data": {
-            "version": "2.4.6",
+            "version": "2.4.7",
             "exported_at": _beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
             "wx_subs": _wx_subs,
             "feedbacks": _feedbacks,
@@ -1404,6 +1406,99 @@ async def index_valuation():
     }
     _set_cache(cache_key, data)
     return {"code": 0, "data": data, "msg": "ok"}
+
+# ═══ v2.4.7 板块榜（腾讯板块：一级行业/二级行业/概念）═══════════════
+# 板块实时行情与日K无需新端点：pt 代码与股票/指数同走 /api/stock/quote、/api/stock/kline
+TENCENT_SECTOR_RANK_URL = "https://proxy.finance.qq.com/cgi/cgi-bin/rank/pt/getRank"
+SECTOR_BOARD_MAP = {
+    "industry": "hy",     # 一级行业（约31个）
+    "industry2": "hy2",   # 二级行业（约124个）
+    "concept": "gn",      # 概念（按涨幅榜取前400）
+}
+
+
+def _fnum(v) -> Optional[float]:
+    try:
+        n = float(v)
+        return n
+    except (TypeError, ValueError):
+        return None
+
+
+@app.get("/api/sector/list")
+async def sector_list(type: str = Query(..., description="industry=一级行业 / industry2=二级行业 / concept=概念")):
+    board = SECTOR_BOARD_MAP.get(type)
+    if not board:
+        raise HTTPException(400, "type 仅支持 industry / industry2 / concept")
+    cache_key = f"sector_list_{type}"
+    cached = _get_cache(cache_key, REALTIME_TTL)
+    if cached is not None:
+        return {"code": 0, "data": cached, "msg": "ok"}
+
+    pages = [(0, 200)] if type != "concept" else [(0, 200), (200, 200)]
+
+    async def _one_page(offset: int, count: int):
+        resp = await _http.get(
+            TENCENT_SECTOR_RANK_URL,
+            params={"board_type": board, "sort_type": "PriceRatio",
+                    "direct": "down", "offset": offset, "count": count},
+            headers={"User-Agent": BROWSER_UA},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        raw = resp.json()
+        if raw.get("code") != 0:
+            raise RuntimeError(f"板块榜上游错误 code={raw.get('code')}")
+        return ((raw.get("data") or {}).get("rank_list")) or []
+
+    parts = await asyncio.gather(*[_one_page(o, c) for o, c in pages],
+                                 return_exceptions=True)
+
+    rows: List[Dict[str, Any]] = []
+    seen = set()
+    for part in parts:
+        if isinstance(part, Exception):
+            logger.warning(f"板块榜分页失败({type}): {part}")
+            continue
+        for it in part:
+            code = str(it.get("code") or "")
+            name = str(it.get("name") or "")
+            if not code or not name or code in seen:
+                continue
+            seen.add(code)
+            lzg = it.get("lzg") or {}
+            zgb = str(it.get("zgb") or "")   # "涨家数/跌家数"
+            up, down = "", ""
+            if "/" in zgb:
+                up, down = zgb.split("/", 1)
+            rows.append({
+                "code": code,
+                "name": name,
+                "price": _fnum(it.get("zxj")),
+                "change": _fnum(it.get("zd")),
+                "changePct": _fnum(it.get("zdf")),
+                "turnover": _fnum(it.get("hsl")),
+                "leadStock": str(lzg.get("name") or ""),
+                "leadStockCode": str(lzg.get("code") or ""),
+                "leadStockChangePct": _fnum(lzg.get("zdf")),
+                "upCount": up,
+                "downCount": down,
+            })
+
+    if not rows:
+        _log_upstream_error("tencent_sector", type, "板块榜为空或全部分页失败")
+        raise HTTPException(502, "板块榜上游无数据")
+
+    data = {
+        "type": type,
+        "items": rows,
+        "count": len(rows),
+        "time": _beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": "腾讯财经",
+    }
+    _set_cache(cache_key, data)
+    return {"code": 0, "data": data, "msg": "ok"}
+
 
 if __name__ == "__main__":
     import uvicorn
