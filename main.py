@@ -182,7 +182,7 @@ async def rate_limit_middleware(request: Request, call_next):
 # ─── 健康检查 + 监控 ────────────────────────────────────────
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "2.4.8"}
+    return {"status": "ok", "version": "2.4.9"}
 
 @app.get("/api/metrics")
 async def metrics(key: str = Query(..., description="管理密钥")):
