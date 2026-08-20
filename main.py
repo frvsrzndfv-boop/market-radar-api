@@ -1,5 +1,5 @@
 """
-行情雷达 - FastAPI 后端 v2.4.5
+行情雷达 - FastAPI 后端 v2.4.9
 v2.0.0: 分时数据接口
 v2.1.0: 用户反馈接口、基金实时估值批量接口
 v2.2.0: 基金档案/股票详细行情/股票K线接口
@@ -16,6 +16,8 @@ v2.4.4: prev_amount_debug 改为逐源错误列表（诊断搜狐源在海外机
 v2.4.5: 昨日成交额主源换同花顺日K（搜狐WAF拦截机房IP返回非JSON；东财push2his断连）
 v2.4.8: 新增 /api/fund/estimate/chart 基金分时估值（fundgz采样曲线，懒注册LRU300）；
          sector/list 加 Cache-Control: public,max-age=60（P3-12）；
+v2.4.9: 分时估值重构 — fundgz 已下线（2026-07-21），改为基于前十大重仓股实时行情加权自建模型；
+         新增 supported/coverage/holdingsDate 字段，诚实标注估算来源与局限性。
 v2.4.7: 新增 /api/sector/list 板块榜端点（腾讯 proxy.finance.qq.com，
          一级行业hy/二级行业hy2/概念gn，60s缓存；板块quote/kline 复用既有 stock 端点，pt代码同源）
 """
@@ -125,653 +127,29 @@ async def lifespan(app: FastAPI):
     _http = httpx.AsyncClient(timeout=15.0)
     _load_feedbacks()
     _load_wx_subs()
-    # v2.4.8 基金分时估值采样器（交易时段每45s轮询fundgz，懒注册）
-    sampler = asyncio.create_task(_est_sampler_loop())
-    logger.info("行情雷达 API v2.4.8 启动完成")
-    yield
-    sampler.cancel()
-    await _http.aclose()
-    logger.info("行情雷达 API 已关闭")
-
-app = FastAPI(
-    title="行情雷达 API v2",
-    description="基金/股票/加密货币 实时数据中转服务",
-    version="2.4.8",
-    lifespan=lifespan,
-)
-
-# ─── 中间件 ─────────────────────────────────────────────────
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[o.strip() for o in ALLOWED_ORIGINS],
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
-)
-
-@app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
-    """IP 限流：每 IP 每分钟最多 80 次请求"""
-    # Render 等代理架构下 request.client.host 是代理 IP，需从 X-Forwarded-For 取真实用户 IP
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        client_ip = xff.split(",")[0].strip()
-    else:
-        client_ip = request.client.host if request.client else "unknown"
-    now = time.time()
-
-    ts_list = _rate_limits.get(client_ip, [])
-    ts_list = [t for t in ts_list if now - t < RATE_WINDOW]
-
-    if len(ts_list) >= RATE_MAX:
-        return JSONResponse(
-            status_code=429,
-            content={"code": -1, "msg": "请求过于频繁，请稍后再试"}
-        )
-
-    ts_list.append(now)
-    _rate_limits[client_ip] = ts_list
-
-    if len(_rate_limits) > 500:
-        _cleanup_rate_limits()
-
-    return await call_next(request)
-
-
-# ─── 健康检查 + 监控 ────────────────────────────────────────
-@app.get("/api/health")
-async def health():
-    return {"status": "ok", "version": "2.4.8"}
-
-@app.get("/api/metrics")
-async def metrics(key: str = Query(..., description="管理密钥")):
-    """基本监控信息：缓存大小、反馈数、订阅数、限流IP数"""
-    if key != ADMIN_KEY:
-        raise HTTPException(status_code=403, detail="bad key")
-    return {
-        "code": 0,
-        "data": {
-            "version": "2.4.7",
-            "cache_size": len(_cache),
-            "feedback_count": len(_feedbacks),
-            "wx_subscribers": sum(len(v) for v in _wx_subs.values()),
-            "rate_limited_ips": len(_rate_limits),
-            "http_client_closed": _http is None or _http.is_closed,
-        },
-        "msg": "ok",
-    }
-
-
-@app.get("/api/admin/backup_state")
-async def backup_state(key: str = Query(..., description="管理密钥")):
-    """v2.4.2 状态导出：供每日 GitHub 备份任务拉取。
-    含涨跌订阅(openid)、用户反馈、成交额内存历史、昨日成交额诊断。"""
-    if key != ADMIN_KEY:
-        raise HTTPException(status_code=403, detail="bad key")
-    return {
-        "code": 0,
-        "data": {
-            "version": "2.4.7",
-            "exported_at": _beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
-            "wx_subs": _wx_subs,
-            "feedbacks": _feedbacks,
-            "amount_hist": _amount_hist,
-            "prev_amount_debug": _prev_amount_debug,
-        },
-        "msg": "ok",
-    }
-
-
-# ─── 腾讯分时数据解析 ─────────────────────────────────────────
-TENCENT_MINUTE_URL = "https://web.ifzq.gtimg.cn/appstock/app/minute/query"
-
-TENCENT_CODE_MAP = {
-    "sh000001": "sh000001", "sz399001": "sz399001", "sz399006": "sz399006",
-    "HSI": "hkHSI", "HSTECH": "hkHSTECH",
-    "sh510050": "sh510050", "sh510300": "sh510300", "sh510500": "sh510500",
-    "sz159915": "sz159915", "sh588000": "sh588000", "sh513100": "sh513100",
-    "sh513520": "sh513520", "sh513180": "sh513180",
-}
-
-
-@app.get("/api/intraday/stock")
-async def stock_intraday(code: str = Query(..., description="指数/ETF代码，如 sh000001")):
-    cache_key = f"intraday_stock_{code}"
-    cached = _get_cache(cache_key, INTRADAY_TTL)
-    if cached is not None:
-        return {"code": 0, "data": cached, "msg": "ok"}
-
-    tencent_code = TENCENT_CODE_MAP.get(code, code)
-
-    try:
-        resp = await _http.get(TENCENT_MINUTE_URL, params={"code": tencent_code})
-        resp.raise_for_status()
-        raw = resp.json()
-    except Exception as e:
-        logger.error(f"腾讯分时请求失败 code={code}: {e}")
-        raise HTTPException(status_code=502, detail=f"上游数据获取失败: {e}")
-
-    if raw.get("code") != 0:
-        _log_upstream_error("tencent_minute", code, f"返回码非0: {raw.get('code')}")
-        raise HTTPException(status_code=502, detail="上游返回错误")
-
-    try:
-        stock_data = raw["data"][tencent_code]["data"]
-        minute_list = stock_data.get("data", [])
-        pre_close = stock_data.get("qt", {}).get(tencent_code, [None, None, None, None])
-
-        points = []
-        for item in minute_list:
-            parts = item.split(" ")
-            if len(parts) >= 3:
-                t = parts[0]
-                price = float(parts[1])
-                vol = int(parts[2])
-                t_fmt = t[:2] + ":" + t[2:] if len(t) == 4 else t
-                points.append({"time": t_fmt, "price": price, "volume": vol})
-
-        prev_close = None
-        if pre_close and len(pre_close) > 3:
-            try:
-                prev_close = float(pre_close[3])
-            except (ValueError, TypeError):
-                pass
-
-        result = {"code": code, "points": points, "prevClose": prev_close, "count": len(points)}
-        _set_cache(cache_key, result)
-        return {"code": 0, "data": result, "msg": "ok"}
-
-    except (KeyError, ValueError, IndexError) as e:
-        _log_upstream_error("tencent_minute", code, str(e), str(raw)[:200])
-        raise HTTPException(status_code=502, detail=f"数据解析失败: {e}")
-
-
-# ─── Gate.io 加密货币分时K线 ──────────────────────────────────
-GATE_KLINES_URL = "https://api.gateio.ws/api/v4/spot/candlesticks"
-
-CRYPTO_SYMBOL_MAP = {
-    "BTC": "BTC_USDT", "ETH": "ETH_USDT", "BNB": "BNB_USDT",
-    "XRP": "XRP_USDT", "ADA": "ADA_USDT", "DOGE": "DOGE_USDT",
-    "SOL": "SOL_USDT", "DOT": "DOT_USDT", "MATIC": "MATIC_USDT",
-    "AVAX": "AVAX_USDT", "SHIB": "SHIB_USDT", "LTC": "LTC_USDT",
-    "TRX": "TRX_USDT", "LINK": "LINK_USDT", "ATOM": "ATOM_USDT",
-    "UNI": "UNI_USDT", "XLM": "XLM_USDT", "NEAR": "NEAR_USDT",
-    "ALGO": "ALGO_USDT", "BCH": "BCH_USDT", "FIL": "FIL_USDT",
-    "VET": "VET_USDT", "ICP": "ICP_USDT", "HBAR": "HBAR_USDT",
-    "SAND": "SAND_USDT", "MANA": "MANA_USDT", "AXS": "AXS_USDT",
-    "THETA": "THETA_USDT", "FTM": "FTM_USDT", "TON": "TON_USDT",
-    "PEPE": "PEPE_USDT", "APT": "APT_USDT", "OP": "OP_USDT",
-    "ARB": "ARB_USDT", "IMX": "IMX_USDT", "RUNE": "RUNE_USDT",
-    "INJ": "INJ_USDT", "SUI": "SUI_USDT", "SEI": "SEI_USDT",
-    "TIA": "TIA_USDT", "JUP": "JUP_USDT", "WIF": "WIF_USDT",
-    "ENA": "ENA_USDT", "PENDLE": "PENDLE_USDT", "STX": "STX_USDT",
-    "RENDER": "RENDER_USDT", "FET": "FET_USDT", "AGIX": "AGIX_USDT",
-    "WLD": "WLD_USDT", "PEOPLE": "PEOPLE_USDT", "AAVE": "AAVE_USDT",
-}
-
-
-@app.get("/api/intraday/crypto")
-async def crypto_intraday(symbol: str = Query(..., description="币种代码，如 BTC")):
-    cache_key = f"intraday_crypto_{symbol}"
-    cached = _get_cache(cache_key, INTRADAY_TTL)
-    if cached is not None:
-        return {"code": 0, "data": cached, "msg": "ok"}
-
-    pair = CRYPTO_SYMBOL_MAP.get(symbol.upper(), f"{symbol.upper()}_USDT")
-
-    try:
-        resp = await _http.get(GATE_KLINES_URL, params={
-            "currency_pair": pair, "interval": "5m", "limit": 288
-        })
-        resp.raise_for_status()
-        raw = resp.json()
-    except Exception as e:
-        logger.error(f"Gate.io 分时请求失败 symbol={symbol}: {e}")
-        raise HTTPException(status_code=502, detail=f"上游数据获取失败: {e}")
-
-    if not raw or not isinstance(raw, list):
-        raise HTTPException(status_code=502, detail="上游返回空数据")
-
-    points = []
-    for kline in raw:
-        if len(kline) < 6:
-            continue
-        try:
-            ts = int(kline[0])
-            utc_time = datetime.fromtimestamp(ts, tz=timezone.utc)
-            bj_time = utc_time + timedelta(hours=8)
-            t_fmt = bj_time.strftime("%H:%M")
-            points.append({
-                "time": t_fmt, "open": float(kline[4]), "high": float(kline[2]),
-                "low": float(kline[3]), "close": float(kline[5]),
-                "volume": float(kline[1]), "timestamp": ts
-            })
-        except (ValueError, TypeError) as e:
-            logger.warning(f"Gate.io K线解析跳过: {e}")
-            continue
-
-    if not points:
-        raise HTTPException(status_code=504, detail="无有效分时数据")
-
-    prev_close = points[0]["open"]
-    result = {
-        "symbol": symbol.upper(), "pair": pair,
-        "points": points, "prevClose": prev_close, "count": len(points)
-    }
-    _set_cache(cache_key, result)
-    return {"code": 0, "data": result, "msg": "ok"}
-
-
-# ─── 基金历史净值（双数据源）──────────────────────────────
-SINA_FUND_URL = "https://stock.finance.sina.com.cn/fundInfo/api/openapi.php/CaihuiFundInfoService.getNav"
-EM_FUND_URL = "https://api.fund.eastmoney.com/f10/lsjz"
-
-
-async def _fetch_sina_fund_history(code: str, days: int = 370) -> list:
-    date_to = datetime.now().strftime("%Y-%m-%d")
-    date_from = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-
-    async def fetch_page(page: int) -> dict:
-        resp = await _http.get(SINA_FUND_URL, params={
-            "symbol": code, "datefrom": date_from, "dateto": date_to, "page": page
-        })
-        resp.raise_for_status()
-        raw = resp.json()
-        return raw.get("result", {}).get("data", {}) or {}
-
-    first = await fetch_page(1)
-    data_list = list(first.get("data") or [])
-    total = int(first.get("total_num") or 0)
-    total_pages = min((total + 20) // 21, 15)
-
-    if total_pages > 1:
-        pages = await asyncio.gather(
-            *[fetch_page(p) for p in range(2, total_pages + 1)], return_exceptions=True
-        )
-        for r in pages:
-            if isinstance(r, dict):
-                data_list.extend(r.get("data") or [])
-
-    history = []
-    for item in data_list:
-        nav = item.get("jjjz")
-        date = (item.get("fbrq") or "")[:10]
-        if nav and date:
-            try:
-                history.append({"date": date, "nav": float(nav)})
-            except (ValueError, TypeError):
-                continue
-
-    history.sort(key=lambda x: x["date"])
-    seen = set()
-    dedup = []
-    for h in history:
-        if h["date"] not in seen:
-            seen.add(h["date"])
-            dedup.append(h)
-    return dedup
-
-
-async def _fetch_em_fund_history(code: str) -> list:
-    resp = await _http.get(EM_FUND_URL, params={
-        "fundCode": code, "pageIndex": 1, "pageSize": 365
-    }, headers={"Referer": "https://fund.eastmoney.com"})
-    resp.raise_for_status()
-    raw = resp.json()
-    lst = (raw or {}).get("Data", {}).get("LSJZList", []) or []
-    history = []
-    for item in reversed(lst):
-        nav = item.get("DWJZ")
-        date = item.get("FSRQ")
-        if nav and date:
-            try:
-                history.append({"date": date, "nav": float(nav)})
-            except (ValueError, TypeError):
-                continue
-    return history
-
-
-@app.get("/api/fund/history")
-async def fund_history(code: str = Query(..., description="基金代码，如 005967")):
-    if not code or len(code) != 6 or not code.isdigit():
-        raise HTTPException(status_code=400, detail="基金代码格式错误，需6位数字")
-
-    cache_key = f"fund_history_{code}"
-    cached = _get_cache(cache_key, HISTORY_TTL)
-    if cached is not None:
-        return {"code": 0, "data": cached, "msg": "ok"}
-
-    history = []
-    errors = []
-
-    try:
-        history = await _fetch_sina_fund_history(code)
-        if history:
-            logger.info(f"新浪源成功 code={code} count={len(history)}")
-    except Exception as e:
-        logger.error(f"新浪基金历史失败 code={code}: {e}")
-        errors.append(f"sina: {e}")
-
-    if not history:
-        try:
-            history = await _fetch_em_fund_history(code)
-            if history:
-                logger.info(f"东方财富源成功 code={code} count={len(history)}")
-        except Exception as e:
-            logger.error(f"东方财富基金历史失败 code={code}: {e}")
-            errors.append(f"em: {e}")
-
-    if not history:
-        raise HTTPException(
-            status_code=404,
-            detail=f"暂无该基金历史数据 ({'; '.join(errors) if errors else 'empty'})"
-        )
-
-    result = {
-        "code": code, "history": history, "count": len(history),
-        "dateRange": f"{history[0]['date']}~{history[-1]['date']}"
-    }
-    _set_cache(cache_key, result)
-    return {"code": 0, "data": result, "msg": "ok"}
-
-
-# ═══ 微信订阅消息（涨跌提醒）══════════════════════════════════
-WX_APPID = "wx7f5552fc52317b2a"
-WX_SECRET = os.environ.get("WX_SECRET", "")
-WX_TEMPLATE_ID = "PUqStjuTo2xby_vdpIZas_VpvZUnUHnmwQtuMwr34wA"
-WX_NOTIFY_KEY = os.environ.get("WX_NOTIFY_KEY", "")
-
-WX_FIELD_NAME = "thing1"
-WX_FIELD_CHANGE = "thing2"
-WX_FIELD_TIME = "time3"
-WX_FIELD_PRICE = "number4"
-
-_wx_subs: Dict[str, list] = {}
-_wx_token_cache: Dict[str, Any] = {"token": None, "ts": 0}
-
-# ─── 涨跌订阅持久化（v2.3.1：进程重启不丢订阅登记）──────────────
-WX_SUBS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wx_subs.json")
-
-def _load_wx_subs():
-    try:
-        if os.path.exists(WX_SUBS_FILE):
-            with open(WX_SUBS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                _wx_subs.update({k: v for k, v in data.items() if isinstance(v, list)})
-            logger.info(f"从文件加载了 {sum(len(v) for v in _wx_subs.values())} 条涨跌订阅")
-    except Exception as e:
-        logger.warning(f"加载涨跌订阅失败: {e}")
-
-def _save_wx_subs():
-    try:
-        with open(WX_SUBS_FILE, "w", encoding="utf-8") as f:
-            json.dump(_wx_subs, f, ensure_ascii=False)
-    except Exception as e:
-        logger.warning(f"涨跌订阅写入失败（忽略）: {e}")
-
-
-async def _wx_access_token() -> str:
-    if _wx_token_cache["token"] and time.time() - _wx_token_cache["ts"] < 7000:
-        return _wx_token_cache["token"]
-    r = await _http.get("https://api.weixin.qq.com/cgi-bin/token", params={
-        "grant_type": "client_credential", "appid": WX_APPID, "secret": WX_SECRET
-    })
-    d = r.json()
-    if "access_token" not in d:
-        raise HTTPException(500, f"wx token error: {d.get('errmsg')}")
-    _wx_token_cache["token"] = d["access_token"]
-    _wx_token_cache["ts"] = time.time()
-    return d["access_token"]
-
-
-@app.post("/api/wx/subscribe")
-async def wx_subscribe(body: dict = Body(...)):
-    js_code = body.get("code", "")
-    fund_code = body.get("fund_code", "")
-    fund_name = (body.get("fund_name", "") or fund_code)[:20]
-    if not (js_code and fund_code):
-        raise HTTPException(400, "missing code or fund_code")
-    if not WX_SECRET:
-        raise HTTPException(500, "WX_SECRET not configured")
-
-    r = await _http.get("https://api.weixin.qq.com/sns/jscode2session", params={
-        "appid": WX_APPID, "secret": WX_SECRET,
-        "js_code": js_code, "grant_type": "authorization_code"
-    })
-    d = r.json()
-    openid = d.get("openid")
-    if not openid:
-        raise HTTPException(400, f"wx login failed: {d.get('errmsg', 'unknown')}")
-
-    subs = _wx_subs.setdefault(fund_code, [])
-    if not any(s["openid"] == openid for s in subs):
-        subs.append({"openid": openid, "name": fund_name, "ts": int(time.time())})
-        _save_wx_subs()
-    logger.info(f"wx subscribe: fund={fund_code} openid={openid[:10]}... total={len(subs)}")
-    return {"code": 0, "data": {"ok": True, "subscribers": len(subs)}, "msg": "ok"}
-
-
-@app.get("/api/jobs/daily_notify")
-async def daily_notify(key: str = Query(...)):
-    if not WX_NOTIFY_KEY or key != WX_NOTIFY_KEY:
-        raise HTTPException(403, "bad key")
-    if not WX_SECRET:
-        raise HTTPException(500, "WX_SECRET not configured")
-
-    sent, failed = 0, 0
-    errors = []
-    targets = [(fc, list(subs)) for fc, subs in _wx_subs.items() if subs]
-    if not targets:
-        return {"code": 0, "data": {"sent": 0, "failed": 0, "msg": "no subscribers"}, "msg": "ok"}
-
-    try:
-        token = await _wx_access_token()
-    except HTTPException as e:
-        logger.error(f"daily_notify: 获取 access_token 失败: {e.detail}")
-        return {"code": -1, "data": {"sent": 0, "failed": 0, "errors": [str(e.detail)]}, "msg": "token error"}
-
-    for fund_code, subs in targets:
-        try:
-            navs = await _fetch_sina_fund_history(fund_code, days=10)
-            if len(navs) < 2:
-                raise ValueError("nav data too short")
-            latest, prev = navs[-1], navs[-2]
-            chg = (latest["nav"] - prev["nav"]) / prev["nav"] * 100
-            name = subs[0]["name"][:10]
-            content = f"{name} {'涨' if chg >= 0 else '跌'}{abs(chg):.2f}%"[:20]
-            date_str = latest["date"]
-        except Exception as e:
-            errors.append(f"{fund_code} nav: {e}")
-            failed += len(subs)
-            continue
-
-        for s in subs:
-            try:
-                r = await _http.post(
-                    f"https://api.weixin.qq.com/cgi-bin/message/subscribe/send?access_token={token}",
-                    json={
-                        "touser": s["openid"],
-                        "template_id": WX_TEMPLATE_ID,
-                        "page": f"pages/detail/detail?code={fund_code}",
-                        "data": {
-                            WX_FIELD_NAME: {"value": name},
-                            WX_FIELD_CHANGE: {"value": ("涨" if chg >= 0 else "跌") + f"{abs(chg):.2f}%"},
-                            WX_FIELD_TIME: {"value": date_str},
-                            WX_FIELD_PRICE: {"value": f"{latest['nav']:.4f}"},
-                        },
-                    }
-                )
-                resp = r.json()
-                if resp.get("errcode") == 0:
-                    sent += 1
-                else:
-                    failed += 1
-                    errors.append(f"{fund_code}/{s['openid'][:8]}: errcode={resp.get('errcode')} {resp.get('errmsg')}")
-            except Exception as e:
-                failed += 1
-                errors.append(f"{fund_code} send: {e}")
-        _wx_subs[fund_code] = []
-
-    _save_wx_subs()
-    logger.info(f"daily_notify done: sent={sent} failed={failed}")
-    return {"code": 0, "data": {"sent": sent, "failed": failed, "errors": errors[:10]}, "msg": "ok"}
-
-
-# ═══ 用户反馈通道 ═════════════════════════════════════════════
-@app.post("/api/feedback")
-async def submit_feedback(body: dict = Body(...)):
-    text = (body.get("text") or "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="反馈内容不能为空")
-
-    entry = {
-        "text": text[:2000],
-        "version": (body.get("version") or "")[:50],
-        "contact": (body.get("contact") or "")[:200],
-        "ts": int(time.time()),
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    _feedbacks.append(entry)
-
-    try:
-        with open(FEEDBACK_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception as e:
-        logger.warning(f"feedback 文件写入失败（忽略）: {e}")
-
-    logger.info(f"feedback received: len={len(text)} version={entry['version']} total={len(_feedbacks)}")
-    return {"code": 0, "data": {"ok": True}, "msg": "ok"}
-
-
-@app.get("/api/feedback/list")
-async def feedback_list(key: str = Query(..., description="管理密钥")):
-    if key != ADMIN_KEY:
-        raise HTTPException(status_code=403, detail="bad key")
-    return {
-        "code": 0,
-        "data": {
-            "count": len(_feedbacks),
-            "items": _feedbacks[-200:],
-            "note": "反馈已持久化到 feedbacks.jsonl，重启后自动加载",
-        },
-        "msg": "ok",
-    }
-
-
-@app.get("/api/feedback/export")
-async def feedback_export(key: str = Query(..., description="管理密钥")):
-    """导出全部反馈为 JSON 文件下载"""
-    if key != ADMIN_KEY:
-        raise HTTPException(status_code=403, detail="bad key")
-    from fastapi.responses import Response
-    content = json.dumps(_feedbacks, ensure_ascii=False, indent=2)
-    return Response(
-        content=content,
-        media_type="application/json",
-        headers={"Content-Disposition": "attachment; filename=feedbacks.json"}
-    )
-
-
-# ═══ 基金实时净值 ════════════════════════════════════════════
-FUND_GZ_URL = "https://fundgz.1234567.com.cn/js/{code}.js"
-FUND_GZ_HEADERS = {"Referer": "https://fund.eastmoney.com/"}
-_JSONPGZ_RE = re.compile(r"^jsonpgz\((.*)\);?\s*$", re.S)
-
-
-async def _fetch_em_latest_nav(code: str) -> Optional[Dict[str, str]]:
-    try:
-        resp = await _http.get(EM_FUND_URL, params={
-            "fundCode": code, "pageIndex": 1, "pageSize": 1
-        }, headers={"Referer": "https://fund.eastmoney.com"})
-        resp.raise_for_status()
-        raw = resp.json()
-        lst = (raw or {}).get("Data", {}).get("LSJZList", []) or []
-        if not lst:
-            return None
-        item = lst[0]
-        return {
-            "nav": item.get("DWJZ") or "",
-            "navDate": item.get("FSRQ") or "",
-            "change": item.get("JZZZL") or "",
-            "accNav": item.get("LJJZ") or "",
-        }
-    except Exception as e:
-        logger.warning(f"东方财富最新净值兜底失败 code={code}: {e}")
-        return None
-
-
-async def _fetch_fund_realtime_one(code: str) -> Dict[str, Any]:
-    fallback = await _fetch_em_latest_nav(code)
-    if fallback and fallback.get("nav"):
-        return {
-            "code": code, "name": "", "nav": fallback["nav"],
-            "navDate": fallback["navDate"], "change": fallback.get("change", ""),
-            "accNav": fallback.get("accNav", ""), "estimate": "",
-            "estimateChange": "", "estimateTime": "",
-        }
-    url = FUND_GZ_URL.format(code=code)
-    try:
-        resp = await _http.get(url, params={"rt": int(time.time() * 1000)}, headers=FUND_GZ_HEADERS)
-        resp.raise_for_status()
-        raw_text = resp.text.strip()
-        m = _JSONPGZ_RE.match(raw_text)
-        if not m:
-            raise ValueError("非 jsonpgz 格式响应")
-        payload = json.loads(m.group(1))
-        return {
-            "code": payload.get("fundcode", code), "name": payload.get("name", ""),
-            "nav": payload.get("dwjz", ""), "navDate": payload.get("jzrq", ""),
-            "estimate": payload.get("gsz", ""), "estimateChange": payload.get("gszzl", ""),
-            "estimateTime": payload.get("gztime", ""),
-        }
-    except Exception as e:
-        logger.warning(f"基金最新净值获取失败 code={code}: {e}")
-        return {"code": code, "error": str(e)}
-
-
-@app.get("/api/fund/realtime")
-async def fund_realtime(codes: str = Query(..., description="基金代码，逗号分隔，最多50只")):
-    code_list: List[str] = []
-    seen = set()
-    for c in codes.split(","):
-        c = c.strip()
-        if c.isdigit() and len(c) == 6 and c not in seen:
-            seen.add(c)
-            code_list.append(c)
-    code_list = code_list[:50]
-
-    if not code_list:
-        return {"code": 0, "data": {"items": []}, "msg": "ok"}
-
-    # v2.4.6 逐只60s缓存：命中直接取，未命中并发抓后写缓存（error不缓存）
-    results: Dict[str, Any] = {}
-    todo: List[str] = []
-    for c in code_list:
-        hit = _get_cache(f"fund_rt_{c}", REALTIME_TTL)
-        if hit is not None:
-            results[c] = hit
-        else:
-            todo.append(c)
-    if todo:
-        fetched = await asyncio.gather(*[_fetch_fund_realtime_one(c) for c in todo])
-        for item in fetched:
-            c = item.get("code", "")
-            if c:
-                results[c] = item
-                if not item.get("error"):
-                    _set_cache(f"fund_rt_{c}", item)
-    items = [results[c] for c in code_list if c in results]
-    return {"code": 0, "data": {"items": items}, "msg": "ok"}
-
-
-# ═══ v2.4.8 基金分时估值（盘中估值曲线）═══════════════════════════
-# 原理与天天基金估值相同：fundgz 单点估值 → 交易时段后台每45s采样一次，
-# 累积成当日分时序列。懒注册：用户请求过的基金才进入采样表（LRU 300只）。
-# 内存采样，服务重启当日清零（标注 sampledFrom 诚实告知）。
+# ═══ v2.4.9 基金分时估值（重仓股加权自建模型）════════════════════════════
+# 背景：2026-07-21 天天基金 fundgz 估值接口正式下线（返回 404），
+# 证监会要求持牌代销平台下架盘中估值功能。本程序作为行情观察工具，
+# 基于公开的前十大重仓股实时行情加权自建估值模型，诚实标注：
+#   · 数据源：前十大重仓股（季度披露，存在滞后）+ 腾讯行情实时价
+#   · 适用范围：仅股票型/偏股混合型基金（持仓充分），债券型/QDII/货币等
+#              返回 supported:false
+#   · 误差说明：未含调仓、申赎、非前十持仓等影响，仅供参考
+# 懒注册：用户请求过的基金才进入采样表（LRU 300只），服务重启当日清零。
 _est_watch: Dict[str, float] = {}          # code → 最近注册时间戳
 _est_points: Dict[str, List[Dict[str, str]]] = {}  # code → 当日 [{t,v,p}]
 _est_state: Dict[str, str] = {"date": ""}  # 当前采样日期（北京时间）
+_est_unsupported: Dict[str, str] = {}      # code → 不支持原因（当日有效）
 EST_WATCH_MAX = 300
+EST_HOLD_TTL = 86400    # 持仓缓存 24h（季报更新后次日生效）
+EST_NAV_TTL = 43200     # 昨收净值缓存 12h（收盘后当日不再变化）
+
+FUND_EST_HOLD_URL = "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNInverstPosition"
+FUND_EST_HOLD_HEADERS = {"User-Agent": "Mozilla/5.0"}
+FUND_EST_DEVICE_ID = "spark_radar_01"
+
+# 东方财富 exchange code → 腾讯行情代码前缀
+_EXCH_MAP = {"1": "sh", "2": "sz"}
 
 
 def _in_trade_window(now: datetime) -> bool:
@@ -783,42 +161,149 @@ def _in_trade_window(now: datetime) -> bool:
 
 
 def _est_rollover(now: datetime):
-    """跨日清空采样点"""
+    """跨日清空采样点与不支持缓存"""
     today = now.strftime("%Y-%m-%d")
     if _est_state["date"] != today:
         _est_state["date"] = today
         _est_points.clear()
+        _est_unsupported.clear()
+
+
+async def _est_get_holdings(code: str) -> Optional[Dict[str, Any]]:
+    """获取基金前十大重仓股（带权重），缓存 24h。返回：
+    {stocks:[{tcode,name,weight}], date(披露日期), coverage(覆盖合计 %)}
+    无股票型持仓或请求失败 → None"""
+    cache_key = f"fund_est_hold_{code}"
+    cached = _get_cache(cache_key, EST_HOLD_TTL)
+    if cached is not None:
+        return cached
+    try:
+        resp = await _http.get(
+            FUND_EST_HOLD_URL,
+            params={
+                "FCODE": code, "deviceid": FUND_EST_DEVICE_ID,
+                "plat": "Android", "product": "EFund", "version": "6.2.4",
+            },
+            headers=FUND_EST_HOLD_HEADERS,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        raw = resp.json()
+        datas = (raw or {}).get("Datas") or {}
+        fund_stocks = datas.get("fundStocks") or []
+        if not fund_stocks:
+            return None
+        disclosure_date = (raw.get("Expansion") or "").strip()
+        stocks = []
+        coverage = 0.0
+        for s in fund_stocks:
+            exch = _EXCH_MAP.get(s.get("TEXCH", ""))
+            gpdm = s.get("GPDM") or ""
+            if not exch or not gpdm:
+                continue
+            try:
+                weight = float(s.get("JZBL") or 0)
+            except (TypeError, ValueError):
+                continue
+            if weight <= 0:
+                continue
+            tcode = f"{exch}{gpdm}"
+            stocks.append({"tcode": tcode, "name": s.get("GPJC", ""), "weight": weight})
+            coverage += weight
+        if not stocks:
+            return None
+        result = {"stocks": stocks, "date": disclosure_date, "coverage": round(coverage, 2)}
+        _set_cache(cache_key, result)
+        return result
+    except Exception as e:
+        logger.warning(f"estimate holdings fail code={code}: {e}")
+        return None
+
+
+async def _est_get_prev_nav(code: str) -> Optional[float]:
+    """取昨日单位净值（用于推算今日估值净值），缓存 12h"""
+    cache_key = f"fund_est_nav_{code}"
+    cached = _get_cache(cache_key, EST_NAV_TTL)
+    if cached is not None:
+        return cached
+    try:
+        nav_data = await _fetch_em_latest_nav(code)
+        if not nav_data or not nav_data.get("nav"):
+            return None
+        v = float(nav_data["nav"])
+        _set_cache(cache_key, v)
+        return v
+    except Exception as e:
+        logger.warning(f"estimate prev_nav fail code={code}: {e}")
+        return None
 
 
 async def _est_sample_one(code: str) -> Optional[Dict[str, Any]]:
-    """采样单只基金当前估值点（fundgz），成功追加到当日序列"""
+    """基于重仓股实时行情加权采样单只基金当前估值点。
+    返回 latest 字典供端点，失败追加返回 None。"""
+    if code in _est_unsupported:
+        return None
+    holdings = await _est_get_holdings(code)
+    if not holdings or not holdings.get("stocks"):
+        _est_unsupported[code] = "持仓未披露"
+        return None
+    prev_nav = await _est_get_prev_nav(code)
+    if not prev_nav:
+        _est_unsupported[code] = "无昨日净值"
+        return None
+
+    stocks = holdings["stocks"]
+    quote_codes = ",".join(s["tcode"] for s in stocks)
+    pct_map: Dict[str, float] = {}  # tcode → 当日涨跌幅 (%)
     try:
         resp = await _http.get(
-            FUND_GZ_URL.format(code=code),
-            params={"rt": int(time.time() * 1000)},
-            headers=FUND_GZ_HEADERS,
-            timeout=8,
+            TENCENT_QUOTE_URL.format(code=quote_codes), timeout=12
         )
         resp.raise_for_status()
-        m = _JSONPGZ_RE.match(resp.text.strip())
-        if not m:
-            return None
-        p = json.loads(m.group(1))
-        gsz = (p.get("gsz") or "").strip()
-        gszzl = (p.get("gszzl") or "").strip()
-        gztime = (p.get("gztime") or "").strip()  # "2026-08-19 14:32:00"
-        if not gsz:
-            return None
-        hm = gztime[11:16] if len(gztime) >= 16 else _beijing_now().strftime("%H:%M")
-        pts = _est_points.setdefault(code, [])
-        if pts and pts[-1]["t"] == hm:
-            pts[-1] = {"t": hm, "v": gsz, "p": gszzl}
-        else:
-            pts.append({"t": hm, "v": gsz, "p": gszzl})
-        return {"estimate": gsz, "estimateChange": gszzl, "estimateTime": gztime}
+        text = resp.content.decode("gbk", errors="ignore")
+        for m in re.finditer(r'v_([A-Za-z0-9]+)="([^"]*)"', text):
+            tcode = m.group(1)
+            f = m.group(2).split("~")
+            if len(f) < 33:
+                continue
+            try:
+                pct = float(f[32]) if f[32] else 0.0
+            except (TypeError, ValueError):
+                pct = 0.0
+            pct_map[tcode] = pct
     except Exception as e:
-        logger.debug(f"estimate sample fail code={code}: {e}")
+        logger.debug(f"estimate quote fail code={code}: {e}")
         return None
+
+    # 加权：Σ(权重% × 涨跌幅%) / 100 → 估值涨幅 (%)
+    contrib = 0.0
+    total_weight = 0.0
+    now_bj = _beijing_now()
+    hm = now_bj.strftime("%H:%M")
+    for s in stocks:
+        pct = pct_map.get(s["tcode"])
+        if pct is None:
+            continue
+        contrib += s["weight"] * pct
+        total_weight += s["weight"]
+    if total_weight <= 0:
+        _est_unsupported[code] = "实时行情缺失"
+        return None
+    est_chg = contrib / 100.0  # 估值涨幅 (%)
+    est_nav = prev_nav * (1 + est_chg / 100)
+
+    pts = _est_points.setdefault(code, [])
+    pt = {"t": hm, "v": f"{est_nav:.4f}", "p": f"{est_chg:.2f}"}
+    if pts and pts[-1]["t"] == hm:
+        pts[-1] = pt
+    else:
+        pts.append(pt)
+    return {
+        "estimate": pt["v"], "estimateChange": pt["p"],
+        "estimateTime": now_bj.strftime("%Y-%m-%d %H:%M:%S"),
+        "coverage": holdings["coverage"],
+        "holdingsDate": holdings["date"],
+    }
 
 
 async def _est_sampler_loop():
@@ -842,28 +327,62 @@ async def _est_sampler_loop():
 
 @app.get("/api/fund/estimate/chart")
 async def fund_estimate_chart(code: str = Query(..., description="基金代码，6位数字")):
-    """基金当日分时估值曲线：注册进采样表并立即采样一次，返回当日全部采样点"""
+    """基金当日分时估值曲线：注册进采样表并立即采样一次，返回当日全部采样点。
+    持仓未披露/非股票型返回 supported:false + 原因。"""
     if not (code.isdigit() and len(code) == 6):
         raise HTTPException(400, "基金代码格式错误")
     now = _beijing_now()
     _est_rollover(now)
-    # LRU 注册：最近请求移到末尾，超 300 只淘汰最旧
+    # LRU 注册
     _est_watch.pop(code, None)
     _est_watch[code] = time.time()
     while len(_est_watch) > EST_WATCH_MAX:
         _est_watch.pop(next(iter(_est_watch)))
+    # 持仓未披露：直接告知（不强行采样）
+    if code in _est_unsupported:
+        return {"code": 0, "data": {
+            "code": code, "date": _est_state["date"],
+            "points": list(_est_points.get(code, [])),
+            "count": len(_est_points.get(code, [])),
+            "latest": None, "trading": _in_trade_window(now),
+            "supported": False,
+            "source": "重仓股加权模型",
+            "note": f"暂不支持估值（{_est_unsupported[code]}），仅股票型/偏股混合型基金持仓披露充分",
+        }, "msg": "ok"}
     latest = await _est_sample_one(code)
     pts = list(_est_points.get(code, []))
+    if latest is None:
+        # 刚刚不支持（本次请求发现）
+        if code in _est_unsupported:
+            return {"code": 0, "data": {
+                "code": code, "date": _est_state["date"],
+                "points": pts, "count": len(pts),
+                "latest": None, "trading": _in_trade_window(now),
+                "supported": False,
+                "source": "重仓股加权模型",
+                "note": f"暂不支持估值（{_est_unsupported[code]}），仅股票型/偏股混合型基金持仓披露充分",
+            }, "msg": "ok"}
+    coverage = latest.get("coverage") if latest else None
+    holdings_date = latest.get("holdingsDate") if latest else ""
+    coverage_note = f"，覆盖率约{coverage}%" if coverage else ""
+    note = (f"估值为本程序基于{holdings_date or '上季'}披露的前十大重仓股实时测算{coverage_note}，"
+            f"可能与实际净值有较大偏差，仅供参考不构成投资建议，以晚间公布净值为准")
     return {"code": 0, "data": {
-        "code": code,
-        "date": _est_state["date"],
-        "points": pts,
-        "count": len(pts),
-        "latest": latest,
+        "code": code, "date": _est_state["date"],
+        "points": pts, "count": len(pts),
+        "latest": {
+            "estimate": latest["estimate"],
+            "estimateChange": latest["estimateChange"],
+            "estimateTime": latest["estimateTime"],
+            "coverage": latest["coverage"],
+            "holdingsDate": latest["holdingsDate"],
+        } if latest else None,
         "trading": _in_trade_window(now),
-        "source": "天天基金估值",
-        "note": "盘中估值为模型测算，与实际净值可能有偏差，以晚间公布净值为准",
+        "supported": True,
+        "source": "重仓股加权模型",
+        "note": note,
     }, "msg": "ok"}
+
 
 
 # ═══ 详情页数据接口 ══════════════════════════════════════════
