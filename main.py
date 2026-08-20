@@ -14,6 +14,8 @@ v2.4.2: 补上 /api/admin/backup_state 状态导出端点（供每日GitHub备�
 v2.4.3: 昨日成交额新增搜狐hisHq为主源（东财push2his对海外机房断连，搜狐可达）
 v2.4.4: prev_amount_debug 改为逐源错误列表（诊断搜狐源在海外机房的失败原因）
 v2.4.5: 昨日成交额主源换同花顺日K（搜狐WAF拦截机房IP返回非JSON；东财push2his断连）
+v2.4.8: 新增 /api/fund/estimate/chart 基金分时估值（fundgz采样曲线，懒注册LRU300）；
+         sector/list 加 Cache-Control: public,max-age=60（P3-12）；
 v2.4.7: 新增 /api/sector/list 板块榜端点（腾讯 proxy.finance.qq.com，
          一级行业hy/二级行业hy2/概念gn，60s缓存；板块quote/kline 复用既有 stock 端点，pt代码同源）
 """
@@ -29,7 +31,7 @@ from typing import Optional, Dict, Any, List
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Body, Request
+from fastapi import FastAPI, HTTPException, Query, Body, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -123,15 +125,18 @@ async def lifespan(app: FastAPI):
     _http = httpx.AsyncClient(timeout=15.0)
     _load_feedbacks()
     _load_wx_subs()
-    logger.info("行情雷达 API v2.4.0 启动完成")
+    # v2.4.8 基金分时估值采样器（交易时段每45s轮询fundgz，懒注册）
+    sampler = asyncio.create_task(_est_sampler_loop())
+    logger.info("行情雷达 API v2.4.8 启动完成")
     yield
+    sampler.cancel()
     await _http.aclose()
     logger.info("行情雷达 API 已关闭")
 
 app = FastAPI(
     title="行情雷达 API v2",
     description="基金/股票/加密货币 实时数据中转服务",
-    version="2.4.7",
+    version="2.4.8",
     lifespan=lifespan,
 )
 
@@ -175,7 +180,7 @@ async def rate_limit_middleware(request: Request, call_next):
 # ─── 健康检查 + 监控 ────────────────────────────────────────
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "2.4.7"}
+    return {"status": "ok", "version": "2.4.8"}
 
 @app.get("/api/metrics")
 async def metrics(key: str = Query(..., description="管理密钥")):
@@ -757,6 +762,108 @@ async def fund_realtime(codes: str = Query(..., description="基金代码，逗�
                     _set_cache(f"fund_rt_{c}", item)
     items = [results[c] for c in code_list if c in results]
     return {"code": 0, "data": {"items": items}, "msg": "ok"}
+
+
+# ═══ v2.4.8 基金分时估值（盘中估值曲线）═══════════════════════════
+# 原理与天天基金估值相同：fundgz 单点估值 → 交易时段后台每45s采样一次，
+# 累积成当日分时序列。懒注册：用户请求过的基金才进入采样表（LRU 300只）。
+# 内存采样，服务重启当日清零（标注 sampledFrom 诚实告知）。
+_est_watch: Dict[str, float] = {}          # code → 最近注册时间戳
+_est_points: Dict[str, List[Dict[str, str]]] = {}  # code → 当日 [{t,v,p}]
+_est_state: Dict[str, str] = {"date": ""}  # 当前采样日期（北京时间）
+EST_WATCH_MAX = 300
+
+
+def _in_trade_window(now: datetime) -> bool:
+    """A股交易时段（北京时间，周一~周五 09:28-11:31 / 12:58-15:04）"""
+    if now.weekday() >= 5:
+        return False
+    hm = now.hour * 100 + now.minute
+    return (928 <= hm <= 1131) or (1258 <= hm <= 1504)
+
+
+def _est_rollover(now: datetime):
+    """跨日清空采样点"""
+    today = now.strftime("%Y-%m-%d")
+    if _est_state["date"] != today:
+        _est_state["date"] = today
+        _est_points.clear()
+
+
+async def _est_sample_one(code: str) -> Optional[Dict[str, Any]]:
+    """采样单只基金当前估值点（fundgz），成功追加到当日序列"""
+    try:
+        resp = await _http.get(
+            FUND_GZ_URL.format(code=code),
+            params={"rt": int(time.time() * 1000)},
+            headers=FUND_GZ_HEADERS,
+            timeout=8,
+        )
+        resp.raise_for_status()
+        m = _JSONPGZ_RE.match(resp.text.strip())
+        if not m:
+            return None
+        p = json.loads(m.group(1))
+        gsz = (p.get("gsz") or "").strip()
+        gszzl = (p.get("gszzl") or "").strip()
+        gztime = (p.get("gztime") or "").strip()  # "2026-08-19 14:32:00"
+        if not gsz:
+            return None
+        hm = gztime[11:16] if len(gztime) >= 16 else _beijing_now().strftime("%H:%M")
+        pts = _est_points.setdefault(code, [])
+        if pts and pts[-1]["t"] == hm:
+            pts[-1] = {"t": hm, "v": gsz, "p": gszzl}
+        else:
+            pts.append({"t": hm, "v": gsz, "p": gszzl})
+        return {"estimate": gsz, "estimateChange": gszzl, "estimateTime": gztime}
+    except Exception as e:
+        logger.debug(f"estimate sample fail code={code}: {e}")
+        return None
+
+
+async def _est_sampler_loop():
+    """交易时段每45s对注册基金并发采样（每批20只）"""
+    while True:
+        try:
+            now = _beijing_now()
+            _est_rollover(now)
+            if _in_trade_window(now) and _est_watch:
+                codes = list(_est_watch.keys())
+                for i in range(0, len(codes), 20):
+                    batch = codes[i:i + 20]
+                    await asyncio.gather(
+                        *[_est_sample_one(c) for c in batch],
+                        return_exceptions=True,
+                    )
+        except Exception as e:
+            logger.warning(f"estimate sampler loop error: {e}")
+        await asyncio.sleep(45)
+
+
+@app.get("/api/fund/estimate/chart")
+async def fund_estimate_chart(code: str = Query(..., description="基金代码，6位数字")):
+    """基金当日分时估值曲线：注册进采样表并立即采样一次，返回当日全部采样点"""
+    if not (code.isdigit() and len(code) == 6):
+        raise HTTPException(400, "基金代码格式错误")
+    now = _beijing_now()
+    _est_rollover(now)
+    # LRU 注册：最近请求移到末尾，超 300 只淘汰最旧
+    _est_watch.pop(code, None)
+    _est_watch[code] = time.time()
+    while len(_est_watch) > EST_WATCH_MAX:
+        _est_watch.pop(next(iter(_est_watch)))
+    latest = await _est_sample_one(code)
+    pts = list(_est_points.get(code, []))
+    return {"code": 0, "data": {
+        "code": code,
+        "date": _est_state["date"],
+        "points": pts,
+        "count": len(pts),
+        "latest": latest,
+        "trading": _in_trade_window(now),
+        "source": "天天基金估值",
+        "note": "盘中估值为模型测算，与实际净值可能有偏差，以晚间公布净值为准",
+    }, "msg": "ok"}
 
 
 # ═══ 详情页数据接口 ══════════════════════════════════════════
@@ -1426,7 +1533,9 @@ def _fnum(v) -> Optional[float]:
 
 
 @app.get("/api/sector/list")
-async def sector_list(type: str = Query(..., description="industry=一级行业 / industry2=二级行业 / concept=概念")):
+async def sector_list(response: Response, type: str = Query(..., description="industry=一级行业 / industry2=二级行业 / concept=概念")):
+    # v2.4.8 P3-12 服务端缓存头：CDN/客户端可缓存60s，减轻重复抓取
+    response.headers["Cache-Control"] = "public, max-age=60"
     board = SECTOR_BOARD_MAP.get(type)
     if not board:
         raise HTTPException(400, "type 仅支持 industry / industry2 / concept")
