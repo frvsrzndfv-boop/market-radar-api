@@ -1,5 +1,5 @@
 """
-行情雷达 - FastAPI 后端 v2.4.9
+行情雷达 - FastAPI 后端 v2.5.0
 v2.0.0: 分时数据接口
 v2.1.0: 用户反馈接口、基金实时估值批量接口
 v2.2.0: 基金档案/股票详细行情/股票K线接口
@@ -18,6 +18,10 @@ v2.4.8: 新增 /api/fund/estimate/chart 基金分时估值（fundgz采样曲线�
          sector/list 加 Cache-Control: public,max-age=60（P3-12）；
 v2.4.9: 分时估值重构 — fundgz 已下线，改为基于前十大重仓股+实时行情加权自建模型；
          新增 supported/coverage/holdingsDate 字段，诚实标注估算来源与局限性。
+v2.5.0: ①基金历史改东财 pingzhongdata 全量（成立至今），sina 兜底；
+         ②新增 /api/sector/stocks 板块成份股端点（腾讯同源 getBoardRankList）；
+         ③新增 gm 前缀全球指数（44个）：报价走东财 clist fs=m:100 批量多主机容错，
+         K线走 EM_KLINE_HOSTS secid=100.{f12}；stock_quote/quotes/kline 自动路由。
 v2.4.7: 新增 /api/sector/list 板块榜端点（腾讯 proxy.finance.qq.com，
          一级行业hy/二级行业hy2/概念gn，60s缓存；板块quote/kline 复用既有 stock 端点，pt代码同源）
 """
@@ -138,7 +142,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="行情雷达 API v2",
     description="基金/股票/加密货币 实时数据中转服务",
-    version="2.4.8",
+    version="2.5.0",
     lifespan=lifespan,
 )
 
@@ -182,7 +186,7 @@ async def rate_limit_middleware(request: Request, call_next):
 # ─── 健康检查 + 监控 ────────────────────────────────────────
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "2.4.9"}
+    return {"status": "ok", "version": "2.5.0"}
 
 @app.get("/api/metrics")
 async def metrics(key: str = Query(..., description="管理密钥")):
@@ -192,7 +196,7 @@ async def metrics(key: str = Query(..., description="管理密钥")):
     return {
         "code": 0,
         "data": {
-            "version": "2.4.7",
+            "version": "2.5.0",
             "cache_size": len(_cache),
             "feedback_count": len(_feedbacks),
             "wx_subscribers": sum(len(v) for v in _wx_subs.values()),
@@ -414,21 +418,23 @@ async def _fetch_sina_fund_history(code: str, days: int = 370) -> list:
 
 
 async def _fetch_em_fund_history(code: str) -> list:
-    resp = await _http.get(EM_FUND_URL, params={
-        "fundCode": code, "pageIndex": 1, "pageSize": 365
-    }, headers={"Referer": "https://fund.eastmoney.com"})
+    """v2.5.0 改用东财 pingzhongdata 全量历史（成立至今），替代 f10 接口（最多约1年）"""
+    resp = await _http.get(EM_PZD_URL.format(code=code), headers=EM_HEADERS,
+                           params={"rt": int(time.time() * 1000)}, timeout=15)
     resp.raise_for_status()
-    raw = resp.json()
-    lst = (raw or {}).get("Data", {}).get("LSJZList", []) or []
+    trend = _js_var_json(resp.text, "Data_netWorthTrend") or []
     history = []
-    for item in reversed(lst):
-        nav = item.get("DWJZ")
-        date = item.get("FSRQ")
-        if nav and date:
-            try:
-                history.append({"date": date, "nav": float(nav)})
-            except (ValueError, TypeError):
-                continue
+    for item in trend:
+        if not isinstance(item, dict):
+            continue
+        nav = item.get("y")
+        date = _ms_to_date(item.get("x"))
+        if nav is None or not date:
+            continue
+        try:
+            history.append({"date": date, "nav": float(nav)})
+        except (ValueError, TypeError):
+            continue
     return history
 
 
@@ -446,21 +452,21 @@ async def fund_history(code: str = Query(..., description="基金代码，如 00
     errors = []
 
     try:
-        history = await _fetch_sina_fund_history(code)
+        history = await _fetch_em_fund_history(code)
         if history:
-            logger.info(f"新浪源成功 code={code} count={len(history)}")
+            logger.info(f"东方财富全量历史成功 code={code} count={len(history)}")
     except Exception as e:
-        logger.error(f"新浪基金历史失败 code={code}: {e}")
-        errors.append(f"sina: {e}")
+        logger.error(f"东方财富基金历史失败 code={code}: {e}")
+        errors.append(f"em: {e}")
 
     if not history:
         try:
-            history = await _fetch_em_fund_history(code)
+            history = await _fetch_sina_fund_history(code)
             if history:
-                logger.info(f"东方财富源成功 code={code} count={len(history)}")
+                logger.info(f"新浪源成功 code={code} count={len(history)}")
         except Exception as e:
-            logger.error(f"东方财富基金历史失败 code={code}: {e}")
-            errors.append(f"em: {e}")
+            logger.error(f"新浪基金历史失败 code={code}: {e}")
+            errors.append(f"sina: {e}")
 
     if not history:
         raise HTTPException(
@@ -1133,6 +1139,164 @@ def _norm_quote_time(raw: str) -> str:
     return raw or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+# ═══ v2.5.0 全球指数扩展（东财 fs=m:100，gm 前缀代码）═══════════════
+EM_GM_CLIST_HOSTS = [
+    "https://push2delay.eastmoney.com",
+    "https://33.push2delay.eastmoney.com",
+    "https://92.push2delay.eastmoney.com",
+]
+EM_GM_CLIST_PATH = "/api/qt/clist/get"
+EM_GM_UT = "fa5fd1943c7b386f172d6893dbfba10b"
+
+# gm 代码 → (东财 f12, 中文名)。报价批量走 clist 一次拉全；K线走 EM_KLINE_HOSTS secid=100.{f12}
+GM_INDEX_MAP: Dict[str, tuple] = {
+    # 欧洲 23
+    "gmFTSE": ("FTSE", "英国富时100"), "gmGDAXI": ("GDAXI", "德国DAX30"),
+    "gmFCHI": ("FCHI", "法国CAC40"), "gmSX5E": ("SX5E", "欧洲斯托克50"),
+    "gmSXXP": ("SXXP", "欧洲斯托克600"), "gmAEX": ("AEX", "荷兰AEX"),
+    "gmSSMI": ("SSMI", "瑞士SMI"), "gmIBEX": ("IBEX", "西班牙IBEX35"),
+    "gmMIB": ("MIB", "意大利MIB"), "gmRTS": ("RTS", "俄罗斯RTS"),
+    "gmWIG": ("WIG", "波兰WIG"), "gmATX": ("ATX", "奥地利ATX"),
+    "gmOSEBX": ("OSEBX", "挪威OSEBX"), "gmOMXSPI": ("OMXSPI", "瑞典OMXSPI"),
+    "gmOMXC20": ("OMXC20", "哥本哈根20"), "gmBFX": ("BFX", "比利时BFX"),
+    "gmISEQ": ("ISEQ", "爱尔兰综合"), "gmPSI20": ("PSI20", "葡萄牙PSI20"),
+    "gmASE": ("ASE", "希腊雅典ASE"), "gmPX": ("PX", "布拉格指数"),
+    "gmICEXI": ("ICEXI", "冰岛ICEX"), "gmHEX": ("HEX", "芬兰赫尔辛基"),
+    "gmMCX": ("MCX", "英国富时250"),
+    # 亚太 13
+    "gmKS11": ("KS11", "韩国KOSPI"), "gmTWII": ("TWII", "台湾加权"),
+    "gmAS51": ("AS51", "澳大利亚标普200"), "gmSENSEX": ("SENSEX", "印度孟买SENSEX"),
+    "gmSTI": ("STI", "新加坡海峡时报"), "gmNZ50": ("NZ50", "新西兰50"),
+    "gmVNINDEX": ("VNINDEX", "越南胡志明"), "gmJKSE": ("JKSE", "印尼雅加达综合"),
+    "gmSET": ("SET", "泰国SET"), "gmKLSE": ("KLSE", "马来西亚KLCI"),
+    "gmPSI": ("PSI", "菲律宾马尼拉"), "gmKSE100": ("KSE100", "巴基斯坦卡拉奇"),
+    "gmCSEALL": ("CSEALL", "斯里兰卡科伦坡"),
+    # 美洲 3
+    "gmTSX": ("TSX", "加拿大S&P/TSX"), "gmBVSP": ("BVSP", "巴西BOVESPA"),
+    "gmMXX": ("MXX", "墨西哥BOLSA"),
+    # 其他 5
+    "gmUDI": ("UDI", "美元指数"), "gmXIN9": ("XIN9", "富时中国A50"),
+    "gmHSAHP": ("HSAHP", "AH股溢价"), "gmNDX100": ("NDX100", "纳斯达克100"),
+    "gmFISAULMU": ("FISAULMU", "沙特阿拉伯指数"),
+}
+
+
+def _gm_f2s(v, nd: int = 2) -> str:
+    try:
+        return f"{float(v):.{nd}f}"
+    except (TypeError, ValueError):
+        return ""
+
+
+def _gm_item_to_quote(gm_code: str, it: dict) -> dict:
+    """东财 clist 字段 → 对齐腾讯 quote 结构（指数无量仓字段，留空串）"""
+    name = GM_INDEX_MAP[gm_code][1]
+    high, low, prev = it.get("f15"), it.get("f16"), it.get("f18")
+    amp = ""
+    try:
+        if high is not None and low is not None and prev is not None and float(prev) > 0:
+            amp = f"{(float(high) - float(low)) / float(prev) * 100:.2f}"
+    except Exception:
+        amp = ""
+    try:
+        tstr = datetime.fromtimestamp(int(it.get("f124")),
+                                      timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        tstr = _beijing_now().strftime("%Y-%m-%d %H:%M:%S")
+    return {
+        "code": gm_code, "name": name, "price": _gm_f2s(it.get("f2")),
+        "prevClose": _gm_f2s(prev), "open": _gm_f2s(it.get("f17")), "time": tstr,
+        "change": _gm_f2s(it.get("f4")), "changePct": _gm_f2s(it.get("f3")),
+        "high": _gm_f2s(high), "low": _gm_f2s(low),
+        "volume": "", "amountWan": "", "turnover": "", "pe": "",
+        "amplitude": amp, "circCapYi": "", "totalCapYi": "", "pb": "",
+        "volRatio": "", "avgPrice": "", "high52": "", "low52": "",
+    }
+
+
+async def _fetch_gm_quotes() -> Dict[str, dict]:
+    """批量拉全部 gm 指数报价（clist fs=m:100 一次63个，60s缓存，多主机容错）"""
+    cached = _get_cache("gm_quotes_all", REALTIME_TTL)
+    if cached is not None:
+        return cached
+    params = {"pn": 1, "pz": 100, "po": 1, "np": 1, "fltt": 2, "invt": 2,
+              "fid": "f3", "fs": "m:100",
+              "fields": "f12,f14,f2,f3,f4,f15,f16,f17,f18,f124", "ut": EM_GM_UT}
+    wanted = {f12: gm for gm, (f12, _n) in GM_INDEX_MAP.items()}
+    last_err = ""
+    for host in EM_GM_CLIST_HOSTS:
+        try:
+            resp = await _http.get(host + EM_GM_CLIST_PATH, params=params, timeout=10)
+            resp.raise_for_status()
+            raw = resp.json()
+            diff = ((raw.get("data") or {}).get("diff")) or []
+            out: Dict[str, dict] = {}
+            for it in diff:
+                gm = wanted.get(str(it.get("f12") or ""))
+                if gm:
+                    out[gm] = _gm_item_to_quote(gm, it)
+            if out:
+                for gm, q in out.items():
+                    _set_cache(f"stock_quote_{gm}", q)
+                _set_cache("gm_quotes_all", out)
+                return out
+            last_err = "empty diff"
+        except Exception as e:
+            last_err = str(e)
+            logger.warning(f"gm_quotes 主机失败 {host}: {e}")
+    _log_upstream_error("gm_quotes", "fs=m:100", f"全部主机失败: {last_err}")
+    return {}
+
+
+async def _fetch_gm_quote_one(code: str) -> dict:
+    q = _get_cache(f"stock_quote_{code}", INTRADAY_TTL)
+    if q is not None:
+        return q
+    quotes = await _fetch_gm_quotes()
+    q = quotes.get(code)
+    if not q:
+        raise HTTPException(502, "全球指数行情源暂不可用")
+    return q
+
+
+async def _fetch_gm_kline(code: str, count: int) -> list:
+    """gm 指数日K：东财 push2his 多主机容错，secid=100.{f12}"""
+    f12 = GM_INDEX_MAP[code][0]
+    params = {"secid": f"100.{f12}", "fields1": "f1,f2,f3",
+              "fields2": "f51,f52,f53,f54,f55,f56", "klt": 101, "fqt": 0,
+              "beg": 0, "end": 20500101, "lmt": count, "ut": EM_GM_UT}
+    klines = None
+    last_err = ""
+    for host in EM_KLINE_HOSTS:
+        try:
+            resp = await _http.get(host + EM_KLINE_PATH, params=params, timeout=12)
+            resp.raise_for_status()
+            raw = resp.json()
+            klines = ((raw.get("data") or {}).get("klines")) or None
+            if klines:
+                break
+        except Exception as e:
+            last_err = str(e)
+            logger.warning(f"gm_kline 主机失败 {host} {code}: {e}")
+    if not klines:
+        raise HTTPException(404, f"暂无该指数K线 ({last_err or 'empty'})")
+    kline = []
+    for row in klines:
+        parts = str(row).split(",")
+        try:
+            kline.append({
+                "date": parts[0][:10], "open": float(parts[1]), "close": float(parts[2]),
+                "high": float(parts[3]), "low": float(parts[4]),
+                "volume": float(parts[5]) if len(parts) > 5 else 0,
+            })
+        except (ValueError, TypeError, IndexError):
+            continue
+    if not kline:
+        raise HTTPException(404, "无K线数据")
+    return kline
+
+
+
 @app.get("/api/stock/quote")
 async def stock_quote(code: str = Query(..., description="腾讯代码，如 sh000001 / sh600519 / hkHSI")):
     if not re.fullmatch(r"[A-Za-z0-9]{2,12}", code or ""):
@@ -1141,6 +1305,12 @@ async def stock_quote(code: str = Query(..., description="腾讯代码，如 sh0
     cached = _get_cache(cache_key, INTRADAY_TTL)
     if cached is not None:
         return {"code": 0, "data": cached, "msg": "ok"}
+
+    if code.startswith("gm"):
+        if code not in GM_INDEX_MAP:
+            raise HTTPException(404, "无该指数代码")
+        data = await _fetch_gm_quote_one(code)
+        return {"code": 0, "data": data, "msg": "ok"}
 
     try:
         resp = await _http.get(TENCENT_QUOTE_URL.format(code=code), timeout=10)
@@ -1197,9 +1367,18 @@ async def stock_quotes(codes: str = Query(..., description="腾讯代码，逗�
         else:
             todo.append(c)
 
-    if todo:
+    gm_todo = [c for c in todo if c.startswith("gm")]
+    tx_todo = [c for c in todo if not c.startswith("gm")]
+
+    if gm_todo:
+        gm_quotes = await _fetch_gm_quotes()
+        for c in gm_todo:
+            if c in gm_quotes:
+                results[c] = gm_quotes[c]
+
+    if tx_todo:
         try:
-            resp = await _http.get(TENCENT_QUOTE_URL.format(code=",".join(todo)), timeout=10)
+            resp = await _http.get(TENCENT_QUOTE_URL.format(code=",".join(tx_todo)), timeout=10)
             resp.raise_for_status()
             text = resp.content.decode("gbk", errors="ignore")
             for m in re.finditer(r'v_([A-Za-z0-9]+)="([^"]*)"', text):
@@ -1222,7 +1401,7 @@ async def stock_quotes(codes: str = Query(..., description="腾讯代码，逗�
                 results[c] = data
                 _set_cache(f"stock_quote_{c}", data)
         except Exception as e:
-            _log_upstream_error("tencent_quotes_batch", ",".join(todo)[:80], f"请求异常: {e}")
+            _log_upstream_error("tencent_quotes_batch", ",".join(tx_todo)[:80], f"请求异常: {e}")
 
     items = [results[c] for c in code_list if c in results]
     return {"code": 0, "data": {"items": items}, "msg": "ok"}
@@ -1236,6 +1415,14 @@ async def stock_kline(code: str = Query(...), count: int = Query(320, ge=10, le=
     cached = _get_cache(cache_key, HISTORY_TTL)
     if cached is not None:
         return {"code": 0, "data": cached, "msg": "ok"}
+
+    if code.startswith("gm"):
+        if code not in GM_INDEX_MAP:
+            raise HTTPException(404, "无该指数代码")
+        kline = await _fetch_gm_kline(code, count)
+        result = {"code": code, "kline": kline, "count": len(kline)}
+        _set_cache(cache_key, result)
+        return {"code": 0, "data": result, "msg": "ok"}
 
     try:
         resp = await _http.get(TENCENT_KLINE_URL,
@@ -1765,6 +1952,71 @@ async def sector_list(response: Response, type: str = Query(..., description="in
     }
     _set_cache(cache_key, data)
     return {"code": 0, "data": data, "msg": "ok"}
+
+
+# ═══ v2.5.0 板块成份股（腾讯同源 getBoardRankList）═══════════════════
+TENCENT_SECTOR_STOCKS_URL = "https://proxy.finance.qq.com/cgi/cgi-bin/rank/hs/getBoardRankList"
+
+
+@app.get("/api/sector/stocks")
+async def sector_stocks(response: Response,
+                        code: str = Query(..., description="板块代码，如 pt01801050"),
+                        offset: int = Query(0, ge=0, le=2000),
+                        count: int = Query(50, ge=1, le=100)):
+    """板块成份股实时行情（按涨幅降序，分页）"""
+    response.headers["Cache-Control"] = "public, max-age=60"
+    if not re.fullmatch(r"pt[A-Za-z0-9]{1,16}", code or ""):
+        raise HTTPException(400, "板块代码格式错误")
+    cache_key = f"sector_stocks_{code}_{offset}_{count}"
+    cached = _get_cache(cache_key, REALTIME_TTL)
+    if cached is not None:
+        return {"code": 0, "data": cached, "msg": "ok"}
+
+    try:
+        resp = await _http.get(
+            TENCENT_SECTOR_STOCKS_URL,
+            params={"board_code": code, "sort_type": "PriceRatio",
+                    "direct": "down", "offset": offset, "count": count},
+            headers={"User-Agent": BROWSER_UA}, timeout=10,
+        )
+        resp.raise_for_status()
+        raw = resp.json()
+    except Exception as e:
+        raise HTTPException(502, f"成份股上游请求失败: {e}")
+    if raw.get("code") != 0:
+        _log_upstream_error("tencent_sector_stocks", code, f"上游错误 code={raw.get('code')}")
+        raise HTTPException(502, f"成份股上游错误 code={raw.get('code')}")
+
+    d = raw.get("data") or {}
+    items = []
+    for it in d.get("rank_list") or []:
+        scode = str(it.get("code") or "")
+        name = str(it.get("name") or "")
+        if not scode or not name:
+            continue
+        items.append({
+            "code": scode,
+            "name": name,
+            "price": _fnum(it.get("zxj")),
+            "change": _fnum(it.get("zd")),
+            "changePct": _fnum(it.get("zdf")),
+            "turnover": _fnum(it.get("hsl")),
+            "volRatio": _fnum(it.get("lb")),
+            "pe": _fnum(it.get("pe_ttm")),
+            "circCapYi": _fnum(it.get("ltsz")),
+            "totalCapYi": _fnum(it.get("zsz")),
+        })
+
+    data = {
+        "code": code, "items": items,
+        "total": d.get("total") or len(items),
+        "offset": offset, "count": count,
+        "time": _beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": "腾讯财经",
+    }
+    _set_cache(cache_key, data)
+    return {"code": 0, "data": data, "msg": "ok"}
+
 
 
 if __name__ == "__main__":
