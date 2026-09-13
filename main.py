@@ -1,5 +1,6 @@
 """
-行情雷达 - FastAPI 后端 v2.5.0
+行情雷达 - FastAPI 后端 v2.5.1
+v2.5.1: 新增/api/fund/returns批量基金收益率
 v2.0.0: 分时数据接口
 v2.1.0: 用户反馈接口、基金实时估值批量接口
 v2.2.0: 基金档案/股票详细行情/股票K线接口
@@ -770,6 +771,42 @@ async def fund_realtime(codes: str = Query(..., description="基金代码，逗�
                     _set_cache(f"fund_rt_{c}", item)
     items = [results[c] for c in code_list if c in results]
     return {"code": 0, "data": {"items": items}, "msg": "ok"}
+
+
+# === v2.5.1 fund batch returns ===
+EM_FUND_RANK_URL = "http://fund.eastmoney.com/data/rankhandler.aspx"
+EM_FUND_RANK_HEADERS = {"User-Agent": BROWSER_UA, "Referer": "http://fund.eastmoney.com/data/fundranking.html"}
+
+@app.get("/api/fund/returns")
+async def fund_returns_batch():
+    cache_key = "fund_returns_batch"
+    cached = _get_cache(cache_key, 3600)
+    if cached is not None:
+        return {"code": 0, "data": cached, "msg": "ok"}
+    try:
+        resp = await _http.get(EM_FUND_RANK_URL, params={"op":"ph","dt":"kf","ft":"all","rs":"","gs":"0","sc":"1nzf","st":"desc","sd":(datetime.now()-timedelta(days=400)).strftime("%Y-%m-%d"),"ed":datetime.now().strftime("%Y-%m-%d"),"qdii":"","tabSubtype":",,,,,","pi":"1","pn":"5000","dx":"1","v":f"0.{int(time.time()*1000)%10**16}"}, headers=EM_FUND_RANK_HEADERS, timeout=20)
+        resp.raise_for_status()
+    except Exception as e:
+        _log_upstream_error("em_fund_rank", "batch", str(e))
+        raise HTTPException(502, f"基金排行数据获取失败: {e}")
+    import re as _re
+    m = _re.search(r'datas:\[(.*?)\]', resp.text, _re.DOTALL)
+    result = {}
+    if m:
+        raw_items = _re.findall(r'"([^"]+)"', m.group(1))
+        for item_str in raw_items:
+            fields = item_str.split(",")
+            if len(fields) >= 12:
+                code, r1y = fields[0], fields[11]
+                if code and r1y:
+                    try:
+                        float(r1y)
+                        result[code] = {"code": code, "r1y": r1y}
+                    except (ValueError, TypeError): pass
+    if not result:
+        raise HTTPException(502, "基金排行数据解析失败")
+    _set_cache(cache_key, result)
+    return {"code": 0, "data": result, "msg": "ok"}
 
 
 # ═══ v2.4.9 基金分时估值（重仓股加权自建模型）════════════════════════════
