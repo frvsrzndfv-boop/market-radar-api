@@ -67,6 +67,9 @@ ALLOWED_ORIGINS = os.environ.get(
     "https://market-radar-api-bgvu.onrender.com,http://localhost:3000"
 ).split(",")
 
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
 # ─── 缓存 ───────────────────────────────────────────────────
 _cache: Dict[str, Dict] = {}
 
