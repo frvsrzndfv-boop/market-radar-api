@@ -65,6 +65,8 @@ ALLOWED_ORIGINS = os.environ.get(
     "ALLOWED_ORIGINS",
     "https://market-radar-api-bgvu.onrender.com,http://localhost:3000"
 ).split(",")
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 
 # ─── 缓存 ───────────────────────────────────────────────────
 _cache: Dict[str, Dict] = {}
@@ -1519,10 +1521,6 @@ EM_ZDFB_URL = "https://push2ex.eastmoney.com/getTopicZDFenBu"
 EM_ZDFB_PARAMS = {
     "ut": "7eea3edcaed734bea9cbfc24409ed989",
     "dpt": "wz.ztzt", "Pageindex": 0, "pagesize": 200, "sort": "zdf:asc",
-}
-DANJUAN_VALUATION_URL = "https://danjuanfunds.com/djapi/index_eva/dj"
-BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 VALUATION_TTL = 43200       # 12 小时
 FUND_RANK_TTL = 43200       # 12 小时
 VALUATION_WHITELIST = [
