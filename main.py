@@ -1521,6 +1521,8 @@ EM_ZDFB_URL = "https://push2ex.eastmoney.com/getTopicZDFenBu"
 EM_ZDFB_PARAMS = {
     "ut": "7eea3edcaed734bea9cbfc24409ed989",
     "dpt": "wz.ztzt", "Pageindex": 0, "pagesize": 200, "sort": "zdf:asc",
+    "token": "7eea3edcaed734bea9cbfc24409ed989"
+}
 VALUATION_TTL = 43200       # 12 小时
 FUND_RANK_TTL = 43200       # 12 小时
 VALUATION_WHITELIST = [
