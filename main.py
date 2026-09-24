@@ -1,6 +1,5 @@
 """
-行情雷达 - FastAPI 后端 v2.5.1
-v2.5.1: 新增/api/fund/returns批量基金收益率
+行情雷达 - FastAPI 后端 v2.5.0
 v2.0.0: 分时数据接口
 v2.1.0: 用户反馈接口、基金实时估值批量接口
 v2.2.0: 基金档案/股票详细行情/股票K线接口
@@ -66,9 +65,6 @@ ALLOWED_ORIGINS = os.environ.get(
     "ALLOWED_ORIGINS",
     "https://market-radar-api-bgvu.onrender.com,http://localhost:3000"
 ).split(",")
-
-BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 
 # ─── 缓存 ───────────────────────────────────────────────────
 _cache: Dict[str, Dict] = {}
@@ -776,22 +772,43 @@ async def fund_realtime(codes: str = Query(..., description="基金代码，逗�
     return {"code": 0, "data": {"items": items}, "msg": "ok"}
 
 
-# === v2.5.1 fund batch returns ===
-EM_FUND_RANK_URL = "http://fund.eastmoney.com/data/rankhandler.aspx"
-EM_FUND_RANK_HEADERS = {"User-Agent": BROWSER_UA, "Referer": "http://fund.eastmoney.com/data/fundranking.html"}
+# ═══ v2.5.1 基金批量收益率（东财排行接口，一次调用获取全部基金区间收益）══
+EM_FUND_RANK_URL = "https://fund.eastmoney.com/data/rankhandler.aspx"
+EM_FUND_RANK_HEADERS = {
+    "User-Agent": BROWSER_UA,
+    "Referer": "https://fund.eastmoney.com/data/fundranking.html",
+}
 
 @app.get("/api/fund/returns")
 async def fund_returns_batch():
+    """批量获取全部开放式基金近1年收益率（东财排行接口，单次返回所有基金）
+    返回 {code: {code, r1y}} 字典，r1y 为近1年涨跌幅(%)字符串"""
     cache_key = "fund_returns_batch"
-    cached = _get_cache(cache_key, 3600)
+    cached = _get_cache(cache_key, 3600)  # 缓存1小时
     if cached is not None:
         return {"code": 0, "data": cached, "msg": "ok"}
+
     try:
-        resp = await _http.get(EM_FUND_RANK_URL, params={"op":"ph","dt":"kf","ft":"all","rs":"","gs":"0","sc":"1nzf","st":"desc","sd":(datetime.now()-timedelta(days=400)).strftime("%Y-%m-%d"),"ed":datetime.now().strftime("%Y-%m-%d"),"qdii":"","tabSubtype":",,,,,","pi":"1","pn":"5000","dx":"1","v":f"0.{int(time.time()*1000)%10**16}"}, headers=EM_FUND_RANK_HEADERS, timeout=20)
+        resp = await _http.get(
+            EM_FUND_RANK_URL,
+            params={
+                "op": "ph", "dt": "kf", "ft": "all", "rs": "", "gs": "0",
+                "sc": "1nzf", "st": "desc",
+                "sd": (datetime.now() - timedelta(days=400)).strftime("%Y-%m-%d"),
+                "ed": datetime.now().strftime("%Y-%m-%d"),
+                "qdii": "", "tabSubtype": ",,,,,",
+                "pi": "1", "pn": "5000", "dx": "1",
+                "v": f"0.{int(time.time()*1000) % 10**16}",
+            },
+            headers=EM_FUND_RANK_HEADERS,
+            timeout=20,
+        )
         resp.raise_for_status()
     except Exception as e:
         _log_upstream_error("em_fund_rank", "batch", str(e))
         raise HTTPException(502, f"基金排行数据获取失败: {e}")
+
+    # 解析响应：datas:[("code,name,...,r1y,..."),...]
     import re as _re
     m = _re.search(r'datas:\[(.*?)\]', resp.text, _re.DOTALL)
     result = {}
@@ -800,14 +817,19 @@ async def fund_returns_batch():
         for item_str in raw_items:
             fields = item_str.split(",")
             if len(fields) >= 12:
-                code, r1y = fields[0], fields[11]
-                if code and r1y:
+                code = fields[0]
+                r1y = fields[11]  # 近1年涨跌幅
+                if code and r1y and r1y != "":
                     try:
-                        float(r1y)
+                        float(r1y)  # 验证是数字
                         result[code] = {"code": code, "r1y": r1y}
-                    except (ValueError, TypeError): pass
+                    except (ValueError, TypeError):
+                        pass
+
     if not result:
+        _log_upstream_error("em_fund_rank", "batch", "解析结果为空")
         raise HTTPException(502, "基金排行数据解析失败")
+
     _set_cache(cache_key, result)
     return {"code": 0, "data": result, "msg": "ok"}
 
