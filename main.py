@@ -128,7 +128,7 @@ def _log_upstream_error(source: str, code: str, reason: str, raw_snippet: str = 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _http
-    _http = httpx.AsyncClient(timeout=15.0)
+    _http = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
     _load_feedbacks()
     _load_wx_subs()
     # v2.4.9 基金分时估值采样器（交易时段每45s基于重仓股加权采样，懒注册）
