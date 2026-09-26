@@ -836,7 +836,7 @@ async def fund_returns_batch():
                 if code and r1y and r1y != "":
                     try:
                         float(r1y)
-                        result[code] = {"code": code, "r1y": r1y}
+                        result[code] = r1y
                     except (ValueError, TypeError):
                         pass
 
