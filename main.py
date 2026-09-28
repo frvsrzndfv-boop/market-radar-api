@@ -1,5 +1,5 @@
 """
-行情雷达 - FastAPI 后端 v2.5.0
+行情雷达 - FastAPI 后端 v2.5.2
 v2.0.0: 分时数据接口
 v2.1.0: 用户反馈接口、基金实时估值批量接口
 v2.2.0: 基金档案/股票详细行情/股票K线接口
@@ -144,7 +144,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="行情雷达 API v2",
     description="基金/股票/加密货币 实时数据中转服务",
-    version="2.5.0",
+    version="2.5.2",
     lifespan=lifespan,
 )
 
@@ -188,7 +188,7 @@ async def rate_limit_middleware(request: Request, call_next):
 # ─── 健康检查 + 监控 ────────────────────────────────────────
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "2.5.0"}
+    return {"status": "ok", "version": "2.5.2"}
 
 @app.get("/api/metrics")
 async def metrics(key: str = Query(..., description="管理密钥")):
@@ -198,7 +198,7 @@ async def metrics(key: str = Query(..., description="管理密钥")):
     return {
         "code": 0,
         "data": {
-            "version": "2.5.0",
+            "version": "2.5.2",
             "cache_size": len(_cache),
             "feedback_count": len(_feedbacks),
             "wx_subscribers": sum(len(v) for v in _wx_subs.values()),
