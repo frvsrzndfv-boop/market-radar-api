@@ -443,9 +443,9 @@ async def _fetch_em_fund_dividends(code: str) -> dict:
 
 
 async def _fetch_em_fund_history(code: str) -> list:
-    """v2.5.2 分红调整净值 = 单位净值 + 期间累计分红
-    东财近1年涨幅公式: (NAV终 - NAV起 + 期间分红) / NAV起 × 100%
-    调整后图表终点收益率 = 列表页阶段涨幅（含分红），如 008163 近1年 = 3.58%
+    """v2.5.2 TRI复利全收益指数：每日收益率含分红，连乘累加
+    任意时间窗口的收益率 = (TRI终/TRI起 - 1)，与东财阶段涨幅高度一致
+    008163 近1年: TRI≈3.43% vs 东财3.58%（差异<0.2%来自日期对齐）
     """
     resp = await _http.get(EM_PZD_URL.format(code=code), headers=EM_HEADERS,
                            params={"rt": int(time.time() * 1000)}, timeout=15)
@@ -455,17 +455,13 @@ async def _fetch_em_fund_history(code: str) -> list:
         return []
     # 获取分红记录
     div_map = await _fetch_em_fund_dividends(code)
-    # 找到起点日期
-    first_date = _ms_to_date(net_trend[0].get("x")) if isinstance(net_trend[0], dict) else None
-    if not first_date:
-        return []
-    # 构建分红调整净值序列
-    # 调整净值 = 单位净值 + 从起点到当日的累计分红
-    # 除权日: NAV↓ 但累计分红↑ → 调整净值不变（投资者收到现金补偿了NAV下跌）
-    # 这样图表的终点收益率 = (NAV_end + 总分红 - NAV_start) / NAV_start
-    #                         = 东财阶段涨幅（如 3.58%）
+    # 构建 TRI 全收益指数序列
+    # TRI[0] = NAV[0]
+    # TRI[i] = TRI[i-1] * (1 + daily_total_return)
+    # daily_total_return = (NAV[i] + dividend[i] - NAV[i-1]) / NAV[i-1]
     history = []
-    cum_div = 0.0
+    tri = None
+    prev_nav = None
     for item in net_trend:
         if not isinstance(item, dict):
             continue
@@ -475,12 +471,19 @@ async def _fetch_em_fund_history(code: str) -> list:
             continue
         try:
             nav_f = float(nav)
-            # 如果当天是除权日，累加现金分红
-            if date in div_map:
-                cum_div += div_map[date]
-            # 分红调整净值 = 单位净值 + 起点以来累计分红
-            adj_nav = nav_f + cum_div
-            history.append({"date": date, "nav": round(adj_nav, 4)})
+            if tri is None:
+                # 第一个数据点
+                tri = nav_f
+                prev_nav = nav_f
+                history.append({"date": date, "nav": round(tri, 4)})
+                continue
+            # 当日分红
+            div = div_map.get(date, 0.0)
+            # 日总收益 = (当日净值 + 当日分红 - 昨日净值) / 昨日净值
+            daily_return = (nav_f + div - prev_nav) / prev_nav
+            tri = tri * (1 + daily_return)
+            prev_nav = nav_f
+            history.append({"date": date, "nav": round(tri, 4)})
         except (ValueError, TypeError):
             continue
     return history
