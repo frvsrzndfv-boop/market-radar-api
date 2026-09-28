@@ -419,22 +419,68 @@ async def _fetch_sina_fund_history(code: str, days: int = 370) -> list:
     return dedup
 
 
+async def _fetch_em_fund_dividends(code: str) -> dict:
+    """v2.5.2 抓取基金分红记录，返回 {除权日: 每份分红金额}"""
+    url = f"https://fundf10.eastmoney.com/fhsp_{code}.html"
+    import re as _re
+    try:
+        resp = await _http.get(url, headers=EM_HEADERS, timeout=10)
+        resp.raise_for_status()
+    except Exception:
+        return {}
+    dividends = {}
+    rows = _re.findall(r'<tr>(.*?)</tr>', resp.text, _re.DOTALL)
+    for row in rows:
+        cells = _re.findall(r'<td[^>]*>(.*?)</td>', row, _re.DOTALL)
+        if len(cells) >= 4 and '派' in row:
+            ex_match = _re.search(r'(\d{4}-\d{2}-\d{2})', cells[1] if len(cells) > 1 else '')
+            amt_match = _re.search(r'派现金([\d.]+)元', row)
+            if ex_match and amt_match:
+                ex_date = ex_match.group(1)
+                amount = float(amt_match.group(1)) / 10  # 每10份→每份
+                dividends[ex_date] = amount
+    return dividends
+
+
 async def _fetch_em_fund_history(code: str) -> list:
-    """v2.5.0 改用东财 pingzhongdata 全量历史（成立至今），替代 f10 接口（最多约1年）"""
+    """v2.5.2 分红调整净值 = 单位净值 + 期间累计分红
+    东财近1年涨幅公式: (NAV终 - NAV起 + 期间分红) / NAV起 × 100%
+    调整后图表终点收益率 = 列表页阶段涨幅（含分红），如 008163 近1年 = 3.58%
+    """
     resp = await _http.get(EM_PZD_URL.format(code=code), headers=EM_HEADERS,
                            params={"rt": int(time.time() * 1000)}, timeout=15)
     resp.raise_for_status()
-    trend = _js_var_json(resp.text, "Data_netWorthTrend") or []
+    net_trend = _js_var_json(resp.text, "Data_netWorthTrend") or []
+    if not net_trend:
+        return []
+    # 获取分红记录
+    div_map = await _fetch_em_fund_dividends(code)
+    # 找到起点日期
+    first_date = _ms_to_date(net_trend[0].get("x")) if isinstance(net_trend[0], dict) else None
+    if not first_date:
+        return []
+    # 构建分红调整净值序列
+    # 调整净值 = 单位净值 + 从起点到当日的累计分红
+    # 除权日: NAV↓ 但累计分红↑ → 调整净值不变（投资者收到现金补偿了NAV下跌）
+    # 这样图表的终点收益率 = (NAV_end + 总分红 - NAV_start) / NAV_start
+    #                         = 东财阶段涨幅（如 3.58%）
     history = []
-    for item in trend:
+    cum_div = 0.0
+    for item in net_trend:
         if not isinstance(item, dict):
             continue
-        nav = item.get("y")
         date = _ms_to_date(item.get("x"))
+        nav = item.get("y")
         if nav is None or not date:
             continue
         try:
-            history.append({"date": date, "nav": float(nav)})
+            nav_f = float(nav)
+            # 如果当天是除权日，累加现金分红
+            if date in div_map:
+                cum_div += div_map[date]
+            # 分红调整净值 = 单位净值 + 起点以来累计分红
+            adj_nav = nav_f + cum_div
+            history.append({"date": date, "nav": round(adj_nav, 4)})
         except (ValueError, TypeError):
             continue
     return history
