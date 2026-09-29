@@ -55,11 +55,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("main")
 
 # ─── 配置 ───────────────────────────────────────────────────
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
-if not ADMIN_KEY:
-    ADMIN_KEY = secrets.token_urlsafe(16)
-    logger.warning("⚠️ ADMIN_KEY 未设置环境变量，已生成随机密钥: " + ADMIN_KEY)
-    logger.warning("⚠️ 请在 Render 后台设置 ADMIN_KEY 环境变量以固定密钥")
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "AOQIQlKnvJDcYl90-Mb_pQ")
 
 ALLOWED_ORIGINS = os.environ.get(
     "ALLOWED_ORIGINS",
