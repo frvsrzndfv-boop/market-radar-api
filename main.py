@@ -55,7 +55,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("main")
 
 # ─── 配置 ───────────────────────────────────────────────────
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "AOQIQlKnvJDcYl90-Mb_pQ")
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
+if not ADMIN_KEY:
+    ADMIN_KEY = secrets.token_urlsafe(16)
+    logger.warning("⚠️ ADMIN_KEY 未设置环境变量，已生成随机密钥: " + ADMIN_KEY)
+    logger.warning("⚠️ 请在 Render 后台设置 ADMIN_KEY 环境变量以固定密钥")
 
 ALLOWED_ORIGINS = os.environ.get(
     "ALLOWED_ORIGINS",
@@ -79,6 +83,29 @@ def _get_cache(key: str, ttl: int) -> Optional[Any]:
 
 def _set_cache(key: str, data: Any):
     _cache[key] = {"data": data, "ts": time.time()}
+
+# ─── v2.5.3 文件缓存（跨冷启动保留，消除重爬东财）──────────
+CACHE_FILE = "/tmp/mr_file_cache.json"
+
+def _save_cache_file():
+    """把内存缓存持久化到文件（跨 Render 冷启动保留）"""
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_cache, f, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"保存缓存文件失败: {e}")
+
+def _load_cache_file():
+    """冷启动时从文件恢复内存缓存"""
+    try:
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    _cache.update(data)
+            logger.info(f"从文件恢复了 {len(_cache)} 条缓存")
+    except Exception as e:
+        logger.warning(f"加载缓存文件失败: {e}")
 
 # ─── HTTP 客户端（生命周期管理）─────────────────────────────
 _http: httpx.AsyncClient = None  # type: ignore
@@ -129,6 +156,7 @@ async def lifespan(app: FastAPI):
     _http = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
     _load_feedbacks()
     _load_wx_subs()
+    _load_cache_file()  # v2.5.3 恢复文件缓存（跨冷启动）
     # v2.4.9 基金分时估值采样器（交易时段每45s基于重仓股加权采样，懒注册）
     sampler = asyncio.create_task(_est_sampler_loop())
     logger.info("行情雷达 API v2.4.9 启动完成")
@@ -831,7 +859,8 @@ async def fund_returns_batch():
     """批量获取全部开放式基金近1年收益率（东财排行接口，分页遍历全部基金）
     返回 {code: {code, r1y}} 字典，r1y 为近1年涨跌幅(%)字符串"""
     cache_key = "fund_returns_batch"
-    cached = _get_cache(cache_key, 3600)  # 缓存1小时
+    # v2.5.3 文件缓存2小时（跨冷启动，消除重爬东财）
+    cached = _get_cache(cache_key, 7200)
     if cached is not None:
         return {"code": 0, "data": cached, "msg": "ok"}
 
@@ -896,6 +925,7 @@ async def fund_returns_batch():
         raise HTTPException(502, "基金排行数据解析失败")
 
     _set_cache(cache_key, result)
+    _save_cache_file()  # v2.5.3 持久化到文件（跨冷启动保留）
     return {"code": 0, "data": result, "msg": "ok"}
 
 
