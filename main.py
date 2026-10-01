@@ -1487,6 +1487,13 @@ async def stock_quotes(codes: str = Query(..., description="腾讯代码，逗�
     return {"code": 0, "data": {"items": items}, "msg": "ok"}
 
 
+# v2.5.4 US指数腾讯源代码映射（腾讯API需要点号格式才能返回完整历史数据）
+TENCENT_US_INDEX_MAP: Dict[str, str] = {
+    "usIXIC": "us.IXIC",   # 纳斯达克综合
+    "usDJI":  "us.DJI",    # 道琼斯
+    "usSPX":  "us.INX",    # 标普500
+}
+
 # v2.5.4 US指数走东财（腾讯源历史数据少，东财有800+点）
 US_INDEX_EM_MAP: Dict[str, str] = {
     "usIXIC": "IXIC",   # 纳斯达克综合
@@ -1514,35 +1521,24 @@ async def stock_kline(code: str = Query(...), count: int = Query(320, ge=10, le=
         _set_cache(cache_key, result)
         return {"code": 0, "data": result, "msg": "ok"}
 
-    # v2.5.4 US/HK/JP指数优先走东财（数据量更大）
-    if code in US_INDEX_EM_MAP:
-        em_f12 = US_INDEX_EM_MAP[code]
-        # 复用 gm kline 逻辑：构造临时 params
-        params = {"secid": f"100.{em_f12}", "fields1": "f1,f2,f3",
-                  "fields2": "f51,f52,f53,f54,f55,f56", "klt": 101, "fqt": 0,
-                  "beg": 0, "end": 20500101, "lmt": count, "ut": EM_GM_UT}
-        klines = None
-        last_err = ""
-        for host in EM_KLINE_HOSTS:
-            try:
-                resp = await _http.get(host + EM_KLINE_PATH, params=params, timeout=12)
-                resp.raise_for_status()
-                raw = resp.json()
-                klines = ((raw.get("data") or {}).get("klines")) or None
-                if klines:
-                    break
-            except Exception as e:
-                last_err = str(e)
-                logger.warning(f"us_kline EM主机失败 {host} {code}: {e}")
-        if klines:
+    # v2.5.4 US指数走腾讯kline端点+点号格式（返回800+点完整历史）
+    tc_code = TENCENT_US_INDEX_MAP.get(code, code)
+    if tc_code != code:
+        try:
+            resp = await _http.get(
+                "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/kline/kline",
+                params={"param": f"{tc_code},day,,,{count}"}, timeout=15)
+            resp.raise_for_status()
+            raw = resp.json()
+            node = (raw.get("data") or {}).get(tc_code) or {}
+            rows = node.get("day") or node.get("qfqday") or []
             kline = []
-            for row in klines:
-                parts = str(row).split(",")
+            for r in rows:
                 try:
                     kline.append({
-                        "date": parts[0][:10], "open": float(parts[1]), "close": float(parts[2]),
-                        "high": float(parts[3]), "low": float(parts[4]),
-                        "volume": float(parts[5]) if len(parts) > 5 else 0,
+                        "date": str(r[0])[:10], "open": float(r[1]), "close": float(r[2]),
+                        "high": float(r[3]), "low": float(r[4]),
+                        "volume": float(r[5]) if len(r) > 5 else 0,
                     })
                 except (ValueError, TypeError, IndexError):
                     continue
@@ -1550,8 +1546,8 @@ async def stock_kline(code: str = Query(...), count: int = Query(320, ge=10, le=
                 result = {"code": code, "kline": kline, "count": len(kline)}
                 _set_cache(cache_key, result)
                 return {"code": 0, "data": result, "msg": "ok"}
-        # 东财失败则降级到腾讯源
-        logger.warning(f"US指数 {code} 东财全部失败，降级腾讯源: {last_err}")
+        except Exception as e:
+            logger.warning(f"US指数腾讯kline失败 {code}: {e}")
 
     try:
         resp = await _http.get(TENCENT_KLINE_URL,
