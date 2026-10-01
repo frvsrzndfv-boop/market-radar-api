@@ -1,5 +1,5 @@
 """
-行情雷达 - FastAPI 后端 v2.5.2
+行情雷达 - FastAPI 后端 v2.5.0
 v2.0.0: 分时数据接口
 v2.1.0: 用户反馈接口、基金实时估值批量接口
 v2.2.0: 基金档案/股票详细行情/股票K线接口
@@ -55,11 +55,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("main")
 
 # ─── 配置 ───────────────────────────────────────────────────
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
-if not ADMIN_KEY:
-    ADMIN_KEY = secrets.token_urlsafe(16)
-    logger.warning("⚠️ ADMIN_KEY 未设置环境变量，已生成随机密钥: " + ADMIN_KEY)
-    logger.warning("⚠️ 请在 Render 后台设置 ADMIN_KEY 环境变量以固定密钥")
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "AOQIQlKnvJDcYl90-Mb_pQ")
 
 ALLOWED_ORIGINS = os.environ.get(
     "ALLOWED_ORIGINS",
@@ -83,29 +79,6 @@ def _get_cache(key: str, ttl: int) -> Optional[Any]:
 
 def _set_cache(key: str, data: Any):
     _cache[key] = {"data": data, "ts": time.time()}
-
-# ─── v2.5.3 文件缓存（跨冷启动保留，消除重爬东财）──────────
-CACHE_FILE = "/tmp/mr_file_cache.json"
-
-def _save_cache_file():
-    """把内存缓存持久化到文件（跨 Render 冷启动保留）"""
-    try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(_cache, f, ensure_ascii=False)
-    except Exception as e:
-        logger.warning(f"保存缓存文件失败: {e}")
-
-def _load_cache_file():
-    """冷启动时从文件恢复内存缓存"""
-    try:
-        if os.path.exists(CACHE_FILE):
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    _cache.update(data)
-            logger.info(f"从文件恢复了 {len(_cache)} 条缓存")
-    except Exception as e:
-        logger.warning(f"加载缓存文件失败: {e}")
 
 # ─── HTTP 客户端（生命周期管理）─────────────────────────────
 _http: httpx.AsyncClient = None  # type: ignore
@@ -156,7 +129,6 @@ async def lifespan(app: FastAPI):
     _http = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
     _load_feedbacks()
     _load_wx_subs()
-    _load_cache_file()  # v2.5.3 恢复文件缓存（跨冷启动）
     # v2.4.9 基金分时估值采样器（交易时段每45s基于重仓股加权采样，懒注册）
     sampler = asyncio.create_task(_est_sampler_loop())
     logger.info("行情雷达 API v2.4.9 启动完成")
@@ -168,7 +140,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="行情雷达 API v2",
     description="基金/股票/加密货币 实时数据中转服务",
-    version="2.5.2",
+    version="2.5.0",
     lifespan=lifespan,
 )
 
@@ -212,7 +184,7 @@ async def rate_limit_middleware(request: Request, call_next):
 # ─── 健康检查 + 监控 ────────────────────────────────────────
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "2.5.2"}
+    return {"status": "ok", "version": "2.5.0"}
 
 @app.get("/api/metrics")
 async def metrics(key: str = Query(..., description="管理密钥")):
@@ -222,7 +194,7 @@ async def metrics(key: str = Query(..., description="管理密钥")):
     return {
         "code": 0,
         "data": {
-            "version": "2.5.2",
+            "version": "2.5.0",
             "cache_size": len(_cache),
             "feedback_count": len(_feedbacks),
             "wx_subscribers": sum(len(v) for v in _wx_subs.values()),
@@ -443,71 +415,24 @@ async def _fetch_sina_fund_history(code: str, days: int = 370) -> list:
     return dedup
 
 
-async def _fetch_em_fund_dividends(code: str) -> dict:
-    """v2.5.2 抓取基金分红记录，返回 {除权日: 每份分红金额}"""
-    url = f"https://fundf10.eastmoney.com/fhsp_{code}.html"
-    import re as _re
-    try:
-        resp = await _http.get(url, headers=EM_HEADERS, timeout=10)
-        resp.raise_for_status()
-    except Exception:
-        return {}
-    dividends = {}
-    rows = _re.findall(r'<tr>(.*?)</tr>', resp.text, _re.DOTALL)
-    for row in rows:
-        cells = _re.findall(r'<td[^>]*>(.*?)</td>', row, _re.DOTALL)
-        if len(cells) >= 4 and '派' in row:
-            ex_match = _re.search(r'(\d{4}-\d{2}-\d{2})', cells[1] if len(cells) > 1 else '')
-            amt_match = _re.search(r'派现金([\d.]+)元', row)
-            if ex_match and amt_match:
-                ex_date = ex_match.group(1)
-                amount = float(amt_match.group(1)) / 10  # 每10份→每份
-                dividends[ex_date] = amount
-    return dividends
-
-
 async def _fetch_em_fund_history(code: str) -> list:
-    """v2.5.2 TRI复利全收益指数：每日收益率含分红，连乘累加
-    任意时间窗口的收益率 = (TRI终/TRI起 - 1)，与东财阶段涨幅高度一致
-    008163 近1年: TRI≈3.43% vs 东财3.58%（差异<0.2%来自日期对齐）
-    """
+    """v2.5.1 改用累计净值（ACWorthTrend）计算收益，修复分红后单位净值下跌导致图表收益率失真"""
     resp = await _http.get(EM_PZD_URL.format(code=code), headers=EM_HEADERS,
                            params={"rt": int(time.time() * 1000)}, timeout=15)
     resp.raise_for_status()
-    net_trend = _js_var_json(resp.text, "Data_netWorthTrend") or []
-    if not net_trend:
-        return []
-    # 获取分红记录
-    div_map = await _fetch_em_fund_dividends(code)
-    # 构建 TRI 全收益指数序列
-    # TRI[0] = NAV[0]
-    # TRI[i] = TRI[i-1] * (1 + daily_total_return)
-    # daily_total_return = (NAV[i] + dividend[i] - NAV[i-1]) / NAV[i-1]
+    # 使用累计净值而非单位净值，避免因基金分红导致图表收益率显示为负
+    trend = _js_var_json(resp.text, "Data_ACWorthTrend") or []
     history = []
-    tri = None
-    prev_nav = None
-    for item in net_trend:
-        if not isinstance(item, dict):
+    for item in trend:
+        # ACWorthTrend 格式: [[timestamp, value], ...]
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
             continue
-        date = _ms_to_date(item.get("x"))
-        nav = item.get("y")
+        nav = item[1]
+        date = _ms_to_date(item[0])
         if nav is None or not date:
             continue
         try:
-            nav_f = float(nav)
-            if tri is None:
-                # 第一个数据点
-                tri = nav_f
-                prev_nav = nav_f
-                history.append({"date": date, "nav": round(tri, 4)})
-                continue
-            # 当日分红
-            div = div_map.get(date, 0.0)
-            # 日总收益 = (当日净值 + 当日分红 - 昨日净值) / 昨日净值
-            daily_return = (nav_f + div - prev_nav) / prev_nav
-            tri = tri * (1 + daily_return)
-            prev_nav = nav_f
-            history.append({"date": date, "nav": round(tri, 4)})
+            history.append({"date": date, "nav": float(nav)})
         except (ValueError, TypeError):
             continue
     return history
@@ -859,8 +784,7 @@ async def fund_returns_batch():
     """批量获取全部开放式基金近1年收益率（东财排行接口，分页遍历全部基金）
     返回 {code: {code, r1y}} 字典，r1y 为近1年涨跌幅(%)字符串"""
     cache_key = "fund_returns_batch"
-    # v2.5.3 文件缓存2小时（跨冷启动，消除重爬东财）
-    cached = _get_cache(cache_key, 7200)
+    cached = _get_cache(cache_key, 3600)  # 缓存1小时
     if cached is not None:
         return {"code": 0, "data": cached, "msg": "ok"}
 
@@ -925,7 +849,6 @@ async def fund_returns_batch():
         raise HTTPException(502, "基金排行数据解析失败")
 
     _set_cache(cache_key, result)
-    _save_cache_file()  # v2.5.3 持久化到文件（跨冷启动保留）
     return {"code": 0, "data": result, "msg": "ok"}
 
 
@@ -1564,6 +1487,16 @@ async def stock_quotes(codes: str = Query(..., description="腾讯代码，逗�
     return {"code": 0, "data": {"items": items}, "msg": "ok"}
 
 
+# v2.5.4 US指数走东财（腾讯源历史数据少，东财有800+点）
+US_INDEX_EM_MAP: Dict[str, str] = {
+    "usIXIC": "IXIC",   # 纳斯达克综合
+    "usDJI":  "DJI",    # 道琼斯
+    "usSPX":  "SPX",    # 标普500
+    "nk225":  "N225",   # 日经225
+    "HSI":    "HSI",    # 恒生指数
+    "HSTECH": "HSTECH", # 恒生科技
+}
+
 @app.get("/api/stock/kline")
 async def stock_kline(code: str = Query(...), count: int = Query(320, ge=10, le=800)):
     if not re.fullmatch(r"[A-Za-z0-9]{2,12}", code or ""):
@@ -1580,6 +1513,45 @@ async def stock_kline(code: str = Query(...), count: int = Query(320, ge=10, le=
         result = {"code": code, "kline": kline, "count": len(kline)}
         _set_cache(cache_key, result)
         return {"code": 0, "data": result, "msg": "ok"}
+
+    # v2.5.4 US/HK/JP指数优先走东财（数据量更大）
+    if code in US_INDEX_EM_MAP:
+        em_f12 = US_INDEX_EM_MAP[code]
+        # 复用 gm kline 逻辑：构造临时 params
+        params = {"secid": f"100.{em_f12}", "fields1": "f1,f2,f3",
+                  "fields2": "f51,f52,f53,f54,f55,f56", "klt": 101, "fqt": 0,
+                  "beg": 0, "end": 20500101, "lmt": count, "ut": EM_GM_UT}
+        klines = None
+        last_err = ""
+        for host in EM_KLINE_HOSTS:
+            try:
+                resp = await _http.get(host + EM_KLINE_PATH, params=params, timeout=12)
+                resp.raise_for_status()
+                raw = resp.json()
+                klines = ((raw.get("data") or {}).get("klines")) or None
+                if klines:
+                    break
+            except Exception as e:
+                last_err = str(e)
+                logger.warning(f"us_kline EM主机失败 {host} {code}: {e}")
+        if klines:
+            kline = []
+            for row in klines:
+                parts = str(row).split(",")
+                try:
+                    kline.append({
+                        "date": parts[0][:10], "open": float(parts[1]), "close": float(parts[2]),
+                        "high": float(parts[3]), "low": float(parts[4]),
+                        "volume": float(parts[5]) if len(parts) > 5 else 0,
+                    })
+                except (ValueError, TypeError, IndexError):
+                    continue
+            if kline:
+                result = {"code": code, "kline": kline, "count": len(kline)}
+                _set_cache(cache_key, result)
+                return {"code": 0, "data": result, "msg": "ok"}
+        # 东财失败则降级到腾讯源
+        logger.warning(f"US指数 {code} 东财全部失败，降级腾讯源: {last_err}")
 
     try:
         resp = await _http.get(TENCENT_KLINE_URL,
