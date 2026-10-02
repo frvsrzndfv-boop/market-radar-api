@@ -1504,6 +1504,11 @@ US_INDEX_EM_MAP: Dict[str, str] = {
     "HSTECH": "HSTECH", # 恒生科技
 }
 
+# v2.5.5 非gm前缀但需走东财K线的代码（secid=100.{f12}）
+EXTRA_EM_KLINE: Dict[str, str] = {
+    "nk225": "N225",
+}
+
 @app.get("/api/stock/kline")
 async def stock_kline(code: str = Query(...), count: int = Query(320, ge=10, le=800)):
     if not re.fullmatch(r"[A-Za-z0-9]{2,12}", code or ""):
@@ -1517,6 +1522,44 @@ async def stock_kline(code: str = Query(...), count: int = Query(320, ge=10, le=
         if code not in GM_INDEX_MAP:
             raise HTTPException(404, "无该指数代码")
         kline = await _fetch_gm_kline(code, count)
+        result = {"code": code, "kline": kline, "count": len(kline)}
+        _set_cache(cache_key, result)
+        return {"code": 0, "data": result, "msg": "ok"}
+
+    # v2.5.5 nk225等非gm前缀但腾讯不支持的指数走东财
+    if code in EXTRA_EM_KLINE:
+        f12 = EXTRA_EM_KLINE[code]
+        params = {"secid": f"100.{f12}", "fields1": "f1,f2,f3",
+                  "fields2": "f51,f52,f53,f54,f55,f56", "klt": 101, "fqt": 0,
+                  "beg": 0, "end": 20500101, "lmt": count, "ut": EM_GM_UT}
+        klines = None
+        last_err = ""
+        for host in EM_KLINE_HOSTS:
+            try:
+                resp = await _http.get(host + EM_KLINE_PATH, params=params, timeout=12)
+                resp.raise_for_status()
+                raw = resp.json()
+                klines = ((raw.get("data") or {}).get("klines")) or None
+                if klines:
+                    break
+            except Exception as e:
+                last_err = str(e)
+                logger.warning(f"em_kline 主机失败 {host} {code}: {e}")
+        if not klines:
+            raise HTTPException(404, f"暂无该指数K线 ({last_err or 'empty'})")
+        kline = []
+        for row in klines:
+            parts = str(row).split(",")
+            try:
+                kline.append({
+                    "date": parts[0][:10], "open": float(parts[1]), "close": float(parts[2]),
+                    "high": float(parts[3]), "low": float(parts[4]),
+                    "volume": float(parts[5]) if len(parts) > 5 else 0,
+                })
+            except (ValueError, TypeError, IndexError):
+                continue
+        if not kline:
+            raise HTTPException(404, "无K线数据")
         result = {"code": code, "kline": kline, "count": len(kline)}
         _set_cache(cache_key, result)
         return {"code": 0, "data": result, "msg": "ok"}
@@ -1598,6 +1641,10 @@ EM_KLINE_HOSTS = [
     "https://push2his.eastmoney.com",
     "https://92.push2his.eastmoney.com",
     "https://48.push2his.eastmoney.com",
+    # v2.5.5 海外容错：push2delay 与 push2his 共用 kline 路径
+    "https://push2delay.eastmoney.com",
+    "https://33.push2delay.eastmoney.com",
+    "https://92.push2delay.eastmoney.com",
 ]
 EM_KLINE_PATH = "/api/qt/stock/kline/get"
 _prev_amount_debug: Dict[str, Any] = {"last_ok_at": None, "errors": []}
